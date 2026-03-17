@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target/
+
+# Cargo lock is committed for binaries
+# Cargo.lock
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.*
+
+# OS
+Thumbs.db

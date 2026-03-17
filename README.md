@@ -136,7 +136,6 @@ cargo fmt --check
 | [turbocable](https://github.com/samaswin/turbocable) | Ruby gem — NATS publisher for broadcasting |
 | [turbocable-rails](https://github.com/samaswin/turbocable-rails) | Rails DSL for TurboCable broadcasts |
 | [@turbocable/client](https://github.com/samaswin/turbocable-client) | JavaScript client for browser connections |
-| [turbocable-server (gem)](https://github.com/samaswin/turbocable-server-gem) | Ruby gem that packages the Rust binary |
 
 ## License
 

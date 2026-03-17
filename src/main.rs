@@ -2,6 +2,7 @@
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 mod config;
+mod connection;
 mod errors;
 mod metrics;
 mod server;

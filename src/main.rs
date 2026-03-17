@@ -5,6 +5,7 @@ mod config;
 mod connection;
 mod errors;
 mod metrics;
+mod protocol;
 mod server;
 
 use clap::Parser;

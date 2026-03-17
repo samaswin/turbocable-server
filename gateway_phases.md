@@ -33,7 +33,7 @@ ulimit -n 100000
 
 ---
 
-## Phase 1 — Skeleton, Config, and Health Check
+## Phase 1 — Skeleton, Config, and Health Check - Completed
 **Goal:** Binary starts, reads config, responds to `/health`. Nothing else.
 **Duration:** 2–3 days
 **Done when:** `cargo run` starts the server and `curl localhost:9292/health` returns `{"status":"ok"}`.
@@ -193,7 +193,7 @@ async fn health() -> Json<serde_json::Value> {
 
 ---
 
-## Phase 2 — Connection Registry
+## Phase 2 — Connection Registry - Completed
 **Goal:** The DashMap-based registry that will hold 1M connections.
 **Duration:** 2–3 days
 **Done when:** Unit tests pass for register, fanout, subscribe, unsubscribe with 10k entries.

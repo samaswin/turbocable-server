@@ -18,6 +18,9 @@ pub struct Config {
 
     #[arg(long, env = "TURBOCABLE_PING_INTERVAL", default_value = "30")]
     pub ping_interval_secs: u64,
+
+    #[arg(long, env = "TURBOCABLE_MAX_CONN_PER_IP", default_value = "10")]
+    pub max_connections_per_ip: u64,
 }
 
 fn default_node_id() -> String {

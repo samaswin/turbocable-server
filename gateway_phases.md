@@ -236,7 +236,7 @@ async fn concurrent_subscribe_from_multiple_tasks() { ... }
 
 ---
 
-## Phase 3 — Protocol Codecs
+## Phase 3 — Protocol Codecs - Completed
 **Goal:** Encode and decode both JSON (ActionCable-compat) and MessagePack frames.
 **Duration:** 2 days
 **Done when:** Round-trip encode/decode tests pass for all command types.
@@ -287,7 +287,7 @@ pub enum ServerMessage {
 
 ---
 
-## Phase 4 — WebSocket Accept Loop
+## Phase 4 — WebSocket Accept Loop - Completed
 **Goal:** Accept WebSocket connections, parse sub-protocol, route to correct codec.
 **No auth yet. No NATS yet.** Just accept → parse one command → log it.
 **Duration:** 2–3 days

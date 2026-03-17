@@ -4,6 +4,7 @@ use smallvec::SmallVec;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
+#[allow(dead_code)]
 pub struct FanoutResult {
     pub sent: usize,
     pub dropped: usize,
@@ -82,6 +83,7 @@ impl Registry {
 
     /// Hot path — no heap allocations, `try_send` only.
     /// Returns how many clients received vs. were dropped (channel full).
+    #[allow(dead_code)]
     pub fn fanout(&self, stream: &str, payload: Bytes) -> FanoutResult {
         let mut sent = 0;
         let mut dropped = 0;

@@ -1,8 +1,5 @@
-#[allow(dead_code)]
 pub mod json;
-#[allow(dead_code)]
 pub mod msgpack;
-#[allow(dead_code)]
 pub mod types;
 
 use bytes::Bytes;
@@ -10,7 +7,6 @@ use bytes::Bytes;
 use crate::errors::GatewayError;
 use types::{ClientCommand, ServerMessage};
 
-#[allow(dead_code)]
 /// Wire-format codec selected during WebSocket sub-protocol negotiation.
 ///
 /// Implementations: [`json::JsonCodec`] (actioncable-v1-json) and
@@ -21,13 +17,10 @@ pub trait Codec: Send + Sync {
 }
 
 /// Sub-protocols advertised during the WebSocket handshake.
-#[allow(dead_code)]
 pub const SUB_PROTOCOL_JSON: &str = "actioncable-v1-json";
-#[allow(dead_code)]
 pub const SUB_PROTOCOL_MSGPACK: &str = "turbocable-v1-msgpack";
 
 /// Return the appropriate codec for a negotiated sub-protocol string.
-#[allow(dead_code)]
 pub fn codec_for_protocol(protocol: &str) -> Option<Box<dyn Codec>> {
     match protocol {
         SUB_PROTOCOL_JSON => Some(Box::new(json::JsonCodec)),

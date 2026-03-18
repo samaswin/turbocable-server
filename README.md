@@ -83,6 +83,23 @@ curl http://localhost:9292/health
 # => {"status":"ok","version":"0.1.0","connections":0}
 ```
 
+### Test NATS fan-out
+
+```bash
+# Terminal 1: connect a WebSocket client
+wscat -c ws://localhost:9292/cable
+# Receives: {"type":"welcome"}
+# Send:     {"command":"subscribe","identifier":"chat_room_1"}
+# Receives: {"type":"confirm_subscription","identifier":"chat_room_1"}
+
+# Terminal 2: publish a message via NATS
+nats pub TURBOCABLE.chat_room_1 '{"text":"hello from NATS!"}'
+# Terminal 1 receives: {"type":"message","identifier":"chat_room_1","message":{"text":"hello from NATS!"},"seq":1}
+```
+
+See [docs/nats-jetstream.md](docs/nats-jetstream.md) for replay testing and full
+NATS integration details.
+
 ### With JWT Authentication
 
 ```bash
@@ -109,6 +126,8 @@ All options can be set via CLI flags or environment variables:
 | `--ping-interval-secs` | `TURBOCABLE_PING_INTERVAL` | `30` | WebSocket ping interval (seconds) |
 | `--max-connections-per-ip` | `TURBOCABLE_MAX_CONN_PER_IP` | `10` | Max concurrent connections per IP |
 | `--jwt-public-key-path` | `TURBOCABLE_JWT_PUBLIC_KEY_PATH` | _(none)_ | Path to RSA public key PEM for JWT auth |
+| `--max-ack-pending` | `TURBOCABLE_MAX_ACK_PENDING` | `10000` | Max unacknowledged NATS JetStream messages (back-pressure) |
+| `--nats-stream-replicas` | `TURBOCABLE_NATS_STREAM_REPLICAS` | `1` | JetStream stream replica count (use 3 in production) |
 
 ## Endpoints
 
@@ -149,6 +168,33 @@ Response (not in JWT `allowed_streams`):
 
 ```json
 {"command":"unsubscribe","identifier":"chat_room_42"}
+```
+
+### Send Message (client → NATS → all subscribers)
+
+```json
+{"command":"message","identifier":"chat_room_42","data":"{\"action\":\"speak\",\"text\":\"hello\"}"}
+```
+
+### Receiving Messages
+
+Live message from NATS fan-out:
+```json
+{"type":"message","identifier":"chat_room_42","message":{"text":"hello"},"seq":42}
+```
+
+### Reconnect Replay
+
+When reconnecting, send a `hello` with the last received `seq` before subscribing:
+```json
+{"type":"hello","last_seq":"42"}
+{"command":"subscribe","identifier":"chat_room_42"}
+```
+
+Missed messages are replayed with `"replayed":true` before the subscription confirmation:
+```json
+{"type":"message","identifier":"chat_room_42","message":{"text":"missed"},"replayed":true,"seq":43}
+{"type":"confirm_subscription","identifier":"chat_room_42"}
 ```
 
 ### JWT Claims
@@ -229,7 +275,7 @@ Every push and pull request to `main` runs the following checks in GitHub Action
 src/
 ├── main.rs                 # jemalloc, Tokio runtime, startup
 ├── config.rs               # CLI/env configuration
-├── server.rs               # Axum router, SO_REUSEPORT listener
+├── server.rs               # Axum router, SO_REUSEPORT listener, NATS init
 ├── errors.rs               # Typed error hierarchy
 ├── auth/
 │   ├── jwt.rs              # RS256 JWT verification, stream glob matching
@@ -242,6 +288,8 @@ src/
 │   ├── types.rs            # ClientCommand / ServerMessage enums
 │   ├── json.rs             # ActionCable-compatible JSON codec
 │   └── msgpack.rs          # Binary codec (rmp-serde)
+├── pubsub/
+│   └── nats.rs             # NATS JetStream consumer, fan-out, publish, replay
 └── metrics/
     └── mod.rs              # Prometheus metrics (stub)
 ```
@@ -253,6 +301,7 @@ src/
 | [docs/architecture.md](docs/architecture.md) | System design, data flow, why Rust, capacity planning |
 | [docs/setup.md](docs/setup.md) | Prerequisites, installation, configuration reference |
 | [docs/jwt-authentication.md](docs/jwt-authentication.md) | JWT auth, stream authorization, manual testing guide |
+| [docs/nats-jetstream.md](docs/nats-jetstream.md) | NATS JetStream fan-out pipeline, replay, and manual testing |
 
 ## Related Packages
 

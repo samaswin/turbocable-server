@@ -126,6 +126,22 @@ mod tests {
         let original = ServerMessage::Message {
             identifier: "chat_1".into(),
             message: json!({"text": "hello", "count": 42}),
+            replayed: None,
+            seq: None,
+        };
+        let encoded = c.encode(&original).unwrap();
+        let decoded = c.decode_server_msg(&encoded);
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn round_trip_replayed_message() {
+        let c = codec();
+        let original = ServerMessage::Message {
+            identifier: "chat_1".into(),
+            message: json!({"text": "replayed"}),
+            replayed: Some(true),
+            seq: Some(9001),
         };
         let encoded = c.encode(&original).unwrap();
         let decoded = c.decode_server_msg(&encoded);

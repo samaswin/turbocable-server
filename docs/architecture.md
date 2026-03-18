@@ -131,7 +131,7 @@ reaches 1M.
 src/
 ├── main.rs                 # jemalloc, Tokio runtime, startup
 ├── config.rs               # clap Config, env vars
-├── server.rs               # Axum router, SO_REUSEPORT listener
+├── server.rs               # Axum router, SO_REUSEPORT listener, NATS init
 ├── errors.rs               # Typed error hierarchy
 ├── auth/
 │   ├── mod.rs
@@ -147,6 +147,9 @@ src/
 │   ├── types.rs            # ClientCommand / ServerMessage enums
 │   ├── json.rs             # ActionCable-compatible JSON codec
 │   └── msgpack.rs          # Binary codec (rmp-serde)
+├── pubsub/
+│   ├── mod.rs              # NATS JetStream module docs
+│   └── nats.rs             # NatsConsumer: fanout, publish, replay
 └── metrics/
     └── mod.rs              # Prometheus gauges, counters, histograms
 ```

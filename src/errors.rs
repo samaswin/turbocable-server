@@ -10,6 +10,9 @@ pub enum GatewayError {
     /// NATS connection or protocol error.
     #[error("NATS error: {0}")]
     Nats(#[from] async_nats::Error),
+    /// JetStream stream or consumer operation failure.
+    #[error("JetStream error: {0}")]
+    JetStream(String),
     /// Client sent an invalid or unparseable protocol frame.
     #[error("protocol error: {0}")]
     Protocol(String),

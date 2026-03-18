@@ -6,8 +6,15 @@ use smallvec::SmallVec;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
+/// Per-connection metadata stored in the registry alongside the outbound sender.
+pub(crate) struct ConnectionEntry {
+    pub sender: mpsc::Sender<Bytes>,
+    /// `true` when the connection uses the binary MessagePack codec;
+    /// `false` for the default JSON (ActionCable-compatible) codec.
+    pub is_binary: bool,
+}
+
 /// Result of a fan-out operation to all subscribers of a stream.
-#[allow(dead_code)]
 pub struct FanoutResult {
     /// Number of subscribers that accepted the message.
     pub sent: usize,
@@ -21,7 +28,7 @@ pub struct FanoutResult {
 /// Uses a reverse map (`conn_streams`) so deregister can clean up all stream
 /// subscriptions in O(streams_per_connection) rather than scanning every stream.
 pub struct Registry {
-    senders: DashMap<u64, mpsc::Sender<Bytes>>,
+    connections: DashMap<u64, ConnectionEntry>,
     streams: DashMap<String, SmallVec<[u64; 32]>>,
     conn_streams: DashMap<u64, SmallVec<[String; 8]>>,
     next_id: AtomicU64,
@@ -38,7 +45,7 @@ impl Registry {
     /// Creates a new registry pre-allocated for ~1.1M connections.
     pub fn new() -> Self {
         Self {
-            senders: DashMap::with_capacity(1_100_000),
+            connections: DashMap::with_capacity(1_100_000),
             streams: DashMap::new(),
             conn_streams: DashMap::with_capacity(1_100_000),
             next_id: AtomicU64::new(1),
@@ -52,8 +59,13 @@ impl Registry {
     }
 
     /// Registers a new connection with its outbound sender channel.
-    pub fn register(&self, conn_id: u64, sender: mpsc::Sender<Bytes>) {
-        self.senders.insert(conn_id, sender);
+    ///
+    /// `is_binary` indicates whether the connection uses MessagePack (`true`)
+    /// or JSON (`false`) encoding, which determines which pre-encoded payload
+    /// is delivered during NATS fan-out.
+    pub fn register(&self, conn_id: u64, sender: mpsc::Sender<Bytes>, is_binary: bool) {
+        self.connections
+            .insert(conn_id, ConnectionEntry { sender, is_binary });
         self.conn_streams.insert(conn_id, SmallVec::new());
         self.active.fetch_add(1, Ordering::Relaxed);
     }
@@ -65,7 +77,7 @@ impl Registry {
                 self.remove_subscriber_from_stream(&stream, conn_id);
             }
         }
-        if self.senders.remove(&conn_id).is_some() {
+        if self.connections.remove(&conn_id).is_some() {
             self.active.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -92,17 +104,40 @@ impl Registry {
         }
     }
 
+    /// Fan-out a single payload to all subscribers of a stream.
+    ///
     /// Hot path — no heap allocations, `try_send` only.
-    /// Returns how many clients received vs. were dropped (channel full).
+    /// Sends the same `payload` to every subscriber regardless of codec type.
+    /// Use [`fanout_encoded`](Self::fanout_encoded) when different encodings
+    /// are needed for JSON vs MessagePack connections (NATS consumer path).
     #[allow(dead_code)]
     pub fn fanout(&self, stream: &str, payload: Bytes) -> FanoutResult {
+        self.fanout_encoded(stream, payload.clone(), payload)
+    }
+
+    /// Fan-out with separate pre-encoded payloads for JSON and MessagePack connections.
+    ///
+    /// This is the hot path used by the NATS consumer: each message is pre-encoded
+    /// once per codec, then routed to the correct connections based on their codec type.
+    /// No per-connection encoding happens here — only `Bytes::clone` (one atomic increment).
+    pub fn fanout_encoded(
+        &self,
+        stream: &str,
+        json_payload: Bytes,
+        binary_payload: Bytes,
+    ) -> FanoutResult {
         let mut sent = 0;
         let mut dropped = 0;
 
         if let Some(subscribers) = self.streams.get(stream) {
             for &conn_id in subscribers.iter() {
-                if let Some(sender) = self.senders.get(&conn_id) {
-                    match sender.try_send(payload.clone()) {
+                if let Some(entry) = self.connections.get(&conn_id) {
+                    let payload = if entry.is_binary {
+                        binary_payload.clone()
+                    } else {
+                        json_payload.clone()
+                    };
+                    match entry.sender.try_send(payload) {
                         Ok(()) => sent += 1,
                         Err(_) => dropped += 1,
                     }
@@ -139,7 +174,7 @@ mod tests {
 
     fn test_registry() -> Registry {
         Registry {
-            senders: DashMap::new(),
+            connections: DashMap::new(),
             streams: DashMap::new(),
             conn_streams: DashMap::new(),
             next_id: AtomicU64::new(1),
@@ -155,7 +190,7 @@ mod tests {
         for _ in 0..1000 {
             let id = reg.allocate_id();
             let (tx, rx) = mpsc::channel(16);
-            reg.register(id, tx);
+            reg.register(id, tx, false);
             reg.subscribe(id, "chat_room_42");
             receivers.push((id, rx));
         }
@@ -181,7 +216,7 @@ mod tests {
         for _ in 0..10 {
             let id = reg.allocate_id();
             let (tx, rx) = mpsc::channel(1);
-            reg.register(id, tx);
+            reg.register(id, tx, false);
             reg.subscribe(id, "stream_a");
             receivers.push((id, rx));
         }
@@ -206,7 +241,7 @@ mod tests {
         let reg = test_registry();
         let id = reg.allocate_id();
         let (tx, _rx) = mpsc::channel(16);
-        reg.register(id, tx);
+        reg.register(id, tx, false);
 
         reg.subscribe(id, "stream_x");
         reg.subscribe(id, "stream_y");
@@ -215,7 +250,7 @@ mod tests {
         reg.deregister(id);
 
         assert_eq!(reg.connection_count(), 0);
-        assert!(!reg.senders.contains_key(&id));
+        assert!(!reg.connections.contains_key(&id));
         assert!(!reg.conn_streams.contains_key(&id));
 
         // All stream entries should have been removed (they had only this subscriber).
@@ -239,7 +274,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let id = reg.allocate_id();
                 let (tx, rx) = mpsc::channel(16);
-                reg.register(id, tx);
+                reg.register(id, tx, false);
                 reg.subscribe(id, "shared_stream");
                 (id, rx)
             }));
@@ -282,7 +317,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let id = reg.allocate_id();
                 let (tx, _rx) = mpsc::channel(1);
-                reg.register(id, tx);
+                reg.register(id, tx, false);
                 id
             }));
         }
@@ -313,7 +348,7 @@ mod tests {
         let reg = test_registry();
         let id = reg.allocate_id();
         let (tx, mut rx) = mpsc::channel(16);
-        reg.register(id, tx);
+        reg.register(id, tx, false);
         reg.subscribe(id, "news");
 
         let result = reg.fanout("news", Bytes::from_static(b"msg1"));
@@ -332,7 +367,7 @@ mod tests {
         let reg = test_registry();
         let id = reg.allocate_id();
         let (tx, mut rx) = mpsc::channel(16);
-        reg.register(id, tx);
+        reg.register(id, tx, false);
 
         reg.subscribe(id, "dup_stream");
         reg.subscribe(id, "dup_stream");
@@ -349,7 +384,7 @@ mod tests {
         let reg = test_registry();
         let id = reg.allocate_id();
         let (tx, _rx) = mpsc::channel(16);
-        reg.register(id, tx);
+        reg.register(id, tx, false);
         reg.subscribe(id, "stream_q");
 
         reg.deregister(id);
@@ -375,7 +410,7 @@ mod tests {
         for _ in 0..10_000 {
             let id = reg.allocate_id();
             let (tx, rx) = mpsc::channel(16);
-            reg.register(id, tx);
+            reg.register(id, tx, false);
             reg.subscribe(id, "large_stream");
             receivers.push(rx);
         }
@@ -389,6 +424,56 @@ mod tests {
 
         for mut rx in receivers {
             assert_eq!(rx.try_recv().unwrap(), payload);
+        }
+    }
+
+    // --- fanout_encoded tests (dual-codec support) ---
+
+    #[tokio::test]
+    async fn fanout_encoded_routes_by_codec() {
+        let reg = test_registry();
+        let json_id = reg.allocate_id();
+        let binary_id = reg.allocate_id();
+
+        let (json_tx, mut json_rx) = mpsc::channel(16);
+        let (bin_tx, mut bin_rx) = mpsc::channel(16);
+
+        reg.register(json_id, json_tx, false);
+        reg.register(binary_id, bin_tx, true);
+        reg.subscribe(json_id, "mixed");
+        reg.subscribe(binary_id, "mixed");
+
+        let json_payload = Bytes::from_static(b"json_frame");
+        let binary_payload = Bytes::from_static(b"msgpack_frame");
+
+        let result = reg.fanout_encoded("mixed", json_payload.clone(), binary_payload.clone());
+        assert_eq!(result.sent, 2);
+        assert_eq!(result.dropped, 0);
+
+        assert_eq!(json_rx.try_recv().unwrap(), json_payload);
+        assert_eq!(bin_rx.try_recv().unwrap(), binary_payload);
+    }
+
+    #[tokio::test]
+    async fn fanout_encoded_all_json_connections() {
+        let reg = test_registry();
+        let mut receivers = Vec::new();
+
+        for _ in 0..5 {
+            let id = reg.allocate_id();
+            let (tx, rx) = mpsc::channel(16);
+            reg.register(id, tx, false);
+            reg.subscribe(id, "json_only");
+            receivers.push(rx);
+        }
+
+        let json_payload = Bytes::from_static(b"json_data");
+        let binary_payload = Bytes::from_static(b"binary_data");
+
+        reg.fanout_encoded("json_only", json_payload.clone(), binary_payload);
+
+        for mut rx in receivers {
+            assert_eq!(rx.try_recv().unwrap(), json_payload);
         }
     }
 }

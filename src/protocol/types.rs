@@ -48,5 +48,13 @@ pub enum ServerMessage {
     Message {
         identifier: String,
         message: serde_json::Value,
+        /// Present and `true` when the message was delivered via JetStream replay
+        /// (reconnect catch-up), allowing clients to deduplicate.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replayed: Option<bool>,
+        /// JetStream stream sequence number for client-side ordering and replay tracking.
+        /// Clients send this back as `last_seq` on reconnect to resume from where they left off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
     },
 }

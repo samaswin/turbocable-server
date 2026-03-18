@@ -18,6 +18,7 @@ use crate::connection::limiter::ConnectionLimiter;
 use crate::connection::registry::Registry;
 use crate::protocol::types::{ClientCommand, ServerMessage};
 use crate::protocol::{self, Codec, SUB_PROTOCOL_JSON, SUB_PROTOCOL_MSGPACK};
+use crate::pubsub::nats::NatsConsumer;
 
 /// Per-connection outbound channel capacity before back-pressure kicks in.
 const CHANNEL_CAPACITY: usize = 16;
@@ -36,6 +37,8 @@ pub struct AppState {
     pub ping_interval_secs: u64,
     /// JWT verifier (absent when auth is disabled).
     pub jwt_verifier: Option<Arc<JwtVerifier>>,
+    /// NATS JetStream consumer for publishing and replay (absent when NATS is unavailable).
+    pub nats_consumer: Option<Arc<NatsConsumer>>,
 }
 
 /// Query parameters extracted from the WebSocket upgrade URL.
@@ -44,6 +47,16 @@ pub struct WsQueryParams {
     /// Optional JWT bearer token.
     #[serde(default)]
     pub token: Option<String>,
+}
+
+/// Client-sent hello message for reconnection with replay.
+/// Distinct from [`ClientCommand`] — uses `"type"` tag instead of `"command"`.
+#[derive(Debug, serde::Deserialize)]
+struct HelloMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    /// Last JetStream stream sequence the client received before disconnecting.
+    last_seq: Option<String>,
 }
 
 /// Axum handler that negotiates the WebSocket sub-protocol and upgrades the connection.
@@ -141,9 +154,10 @@ async fn handle_socket(
 
     let codec = protocol::codec_for_protocol(protocol).expect("negotiated protocol must be valid");
 
+    let is_binary = protocol == SUB_PROTOCOL_MSGPACK;
     let conn_id = state.registry.allocate_id();
     let (tx, rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
-    state.registry.register(conn_id, tx.clone());
+    state.registry.register(conn_id, tx.clone(), is_binary);
 
     tracing::info!(conn_id, %ip, protocol, "connection accepted");
 
@@ -151,12 +165,20 @@ async fn handle_socket(
         let _ = tx.send(welcome).await;
     }
 
-    let is_binary = protocol == SUB_PROTOCOL_MSGPACK;
     let (ws_sender, ws_receiver) = socket.split();
 
     let outbound_handle = tokio::spawn(outbound_loop(rx, ws_sender, is_binary));
 
-    inbound_loop(ws_receiver, &tx, &*codec, conn_id, &state, &allowed_streams).await;
+    inbound_loop(
+        ws_receiver,
+        &tx,
+        &*codec,
+        is_binary,
+        conn_id,
+        &state,
+        &allowed_streams,
+    )
+    .await;
 
     state.registry.deregister(conn_id);
     state.limiter.release(ip);
@@ -196,6 +218,7 @@ async fn inbound_loop(
     mut receiver: SplitStream<WebSocket>,
     tx: &mpsc::Sender<Bytes>,
     codec: &dyn Codec,
+    is_binary: bool,
     conn_id: u64,
     state: &AppState,
     allowed_streams: &[String],
@@ -203,15 +226,25 @@ async fn inbound_loop(
     let mut ping_interval = tokio::time::interval(Duration::from_secs(state.ping_interval_secs));
     ping_interval.tick().await;
 
+    // Stores the last_seq from a client "hello" message for reconnection replay.
+    // Set once per connection, consumed during subsequent subscribe commands.
+    let mut last_seq: Option<u64> = None;
+
     loop {
         tokio::select! {
             msg = receiver.next() => {
                 match msg {
                     Some(Ok(Message::Text(ref text))) => {
-                        handle_client_frame(text.as_bytes(), codec, conn_id, tx, state, allowed_streams).await;
+                        handle_client_frame(
+                            text.as_bytes(), codec, is_binary, conn_id,
+                            tx, state, allowed_streams, &mut last_seq,
+                        ).await;
                     }
                     Some(Ok(Message::Binary(ref data))) => {
-                        handle_client_frame(data, codec, conn_id, tx, state, allowed_streams).await;
+                        handle_client_frame(
+                            data, codec, is_binary, conn_id,
+                            tx, state, allowed_streams, &mut last_seq,
+                        ).await;
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                     Some(Ok(Message::Close(_))) | None => break,
@@ -239,10 +272,12 @@ async fn inbound_loop(
 async fn handle_client_frame(
     data: &[u8],
     codec: &dyn Codec,
+    is_binary: bool,
     conn_id: u64,
     tx: &mpsc::Sender<Bytes>,
     state: &AppState,
     allowed_streams: &[String],
+    last_seq: &mut Option<u64>,
 ) {
     match codec.decode(data) {
         Ok(cmd) => {
@@ -264,6 +299,13 @@ async fn handle_client_frame(
                     }
 
                     state.registry.subscribe(conn_id, &identifier);
+
+                    // Replay missed messages when client reconnected with last_seq.
+                    // Happens before confirm so the client receives replayed messages first.
+                    if let Some(seq) = *last_seq {
+                        replay_for_stream(&identifier, seq, conn_id, codec, tx, state).await;
+                    }
+
                     if let Ok(confirm) =
                         codec.encode(&ServerMessage::ConfirmSubscription { identifier })
                     {
@@ -277,17 +319,113 @@ async fn handle_client_frame(
                     identifier,
                     ref data,
                 } => {
-                    tracing::debug!(
-                        conn_id,
-                        identifier,
-                        data,
-                        "client message (NATS not yet wired)"
-                    );
+                    if let Some(ref nats) = state.nats_consumer {
+                        let payload = Bytes::copy_from_slice(data.as_bytes());
+                        if let Err(e) = nats.publish(&identifier, payload).await {
+                            tracing::warn!(
+                                conn_id,
+                                identifier,
+                                error = %e,
+                                "failed to publish client message to NATS"
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            conn_id,
+                            identifier,
+                            "client message dropped (NATS not available)"
+                        );
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            // Not a standard command — try parsing as a "hello" reconnection message.
+            if try_parse_hello(data, is_binary, conn_id, last_seq) {
+                return;
+            }
+            tracing::warn!(conn_id, "failed to decode client frame");
+        }
+    }
+}
+
+/// Attempts to parse the frame as a `{"type":"hello","last_seq":"N"}` message.
+/// Returns `true` if successfully parsed, `false` otherwise.
+fn try_parse_hello(data: &[u8], is_binary: bool, conn_id: u64, last_seq: &mut Option<u64>) -> bool {
+    let hello: Option<HelloMessage> = if is_binary {
+        rmp_serde::from_slice(data).ok()
+    } else {
+        serde_json::from_slice(data).ok()
+    };
+
+    if let Some(hello) = hello {
+        if hello.msg_type == "hello" {
+            let seq = hello
+                .last_seq
+                .as_deref()
+                .and_then(|s| s.parse::<u64>().ok());
+            *last_seq = seq;
+            tracing::info!(
+                conn_id,
+                last_seq = ?seq,
+                "client hello received"
+            );
+            return true;
+        }
+    }
+    false
+}
+
+/// Replays missed messages from JetStream for a specific stream after client reconnection.
+async fn replay_for_stream(
+    stream_name: &str,
+    last_seq: u64,
+    conn_id: u64,
+    codec: &dyn Codec,
+    tx: &mpsc::Sender<Bytes>,
+    state: &AppState,
+) {
+    let nats = match state.nats_consumer {
+        Some(ref n) => n,
+        None => return,
+    };
+
+    match nats.replay_since(stream_name, last_seq).await {
+        Ok(messages) => {
+            tracing::info!(
+                conn_id,
+                stream = stream_name,
+                count = messages.len(),
+                "replaying missed messages"
+            );
+
+            for msg in messages {
+                // Parse the raw NATS payload, falling back to null for unparseable data.
+                let payload: serde_json::Value = serde_json::from_slice(&msg.payload)
+                    .or_else(|_| rmp_serde::from_slice(&msg.payload))
+                    .unwrap_or(serde_json::Value::Null);
+
+                let server_msg = ServerMessage::Message {
+                    identifier: stream_name.to_string(),
+                    message: payload,
+                    replayed: Some(true),
+                    seq: Some(msg.sequence),
+                };
+
+                if let Ok(encoded) = codec.encode(&server_msg) {
+                    if tx.send(encoded).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
         Err(e) => {
-            tracing::warn!(conn_id, error = %e, "failed to decode client frame");
+            tracing::error!(
+                conn_id,
+                stream = stream_name,
+                error = %e,
+                "message replay failed"
+            );
         }
     }
 }

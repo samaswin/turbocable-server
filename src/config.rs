@@ -33,6 +33,16 @@ pub struct Config {
     /// Path to an RSA public key PEM file for JWT verification.
     #[arg(long, env = "TURBOCABLE_JWT_PUBLIC_KEY_PATH")]
     pub jwt_public_key_path: Option<String>,
+
+    /// Maximum number of unacknowledged messages the NATS JetStream consumer allows.
+    /// Controls back-pressure: prevents a slow gateway from being overwhelmed by NATS.
+    #[arg(long, env = "TURBOCABLE_MAX_ACK_PENDING", default_value = "10000")]
+    pub max_ack_pending: i64,
+
+    /// Number of replicas for the TURBOCABLE JetStream stream.
+    /// Use 1 for local dev (single NATS node) and 3 for production clusters.
+    #[arg(long, env = "TURBOCABLE_NATS_STREAM_REPLICAS", default_value = "1")]
+    pub nats_stream_replicas: usize,
 }
 
 /// Generates a random node ID prefixed with `node_`.

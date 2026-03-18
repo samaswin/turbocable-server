@@ -148,6 +148,8 @@ mod tests {
         let msg = ServerMessage::Message {
             identifier: "chat_1".into(),
             message: json!({"text": "hello", "sender": "alice"}),
+            replayed: None,
+            seq: None,
         };
         let bytes = codec().encode(&msg).unwrap();
         let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -157,6 +159,28 @@ mod tests {
                 "type": "message",
                 "identifier": "chat_1",
                 "message": {"text": "hello", "sender": "alice"}
+            })
+        );
+    }
+
+    #[test]
+    fn encode_replayed_message_includes_seq() {
+        let msg = ServerMessage::Message {
+            identifier: "chat_1".into(),
+            message: json!({"text": "replayed msg"}),
+            replayed: Some(true),
+            seq: Some(8841),
+        };
+        let bytes = codec().encode(&msg).unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val,
+            json!({
+                "type": "message",
+                "identifier": "chat_1",
+                "message": {"text": "replayed msg"},
+                "replayed": true,
+                "seq": 8841
             })
         );
     }
@@ -242,6 +266,8 @@ mod tests {
             ServerMessage::Message {
                 identifier: "ch_3".into(),
                 message: json!({"key": "value"}),
+                replayed: None,
+                seq: None,
             },
         ];
 

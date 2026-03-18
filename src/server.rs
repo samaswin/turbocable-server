@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::connection::handler::{ws_upgrade, AppState};
 use crate::connection::limiter::ConnectionLimiter;
 use crate::connection::registry::Registry;
+use crate::pubsub::nats::NatsConsumer;
 
 /// Starts the gateway: builds shared state, binds the listener, and serves requests.
 pub async fn run(cfg: Config) {
@@ -19,12 +20,14 @@ pub async fn run(cfg: Config) {
     let limiter = Arc::new(ConnectionLimiter::new(cfg.max_connections_per_ip));
 
     let jwt_verifier = init_jwt_verifier(&cfg).await;
+    let nats_consumer = init_nats_consumer(&cfg, &registry).await;
 
     let state = AppState {
         registry: registry.clone(),
         limiter,
         ping_interval_secs: cfg.ping_interval_secs,
         jwt_verifier,
+        nats_consumer,
     };
 
     let app = Router::new()
@@ -82,6 +85,37 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "connections": state.registry.connection_count(),
     }))
+}
+
+/// Connects to NATS, ensures the JetStream stream, and starts the background
+/// fan-out consumer loop. Returns `None` if NATS is unavailable (gateway runs
+/// without pub/sub — useful for local development and testing).
+async fn init_nats_consumer(cfg: &Config, registry: &Arc<Registry>) -> Option<Arc<NatsConsumer>> {
+    match NatsConsumer::connect(&cfg.nats_url, cfg.nats_stream_replicas).await {
+        Ok(consumer) => {
+            let consumer = Arc::new(consumer);
+            consumer.start_fanout_loop(
+                cfg.node_id.clone(),
+                Arc::clone(registry),
+                cfg.max_ack_pending,
+            );
+            tracing::info!(
+                nats_url = %cfg.nats_url,
+                node_id = %cfg.node_id,
+                max_ack_pending = cfg.max_ack_pending,
+                "NATS JetStream consumer active"
+            );
+            Some(consumer)
+        }
+        Err(e) => {
+            tracing::warn!(
+                nats_url = %cfg.nats_url,
+                error = %e,
+                "NATS JetStream unavailable — running without pub/sub"
+            );
+            None
+        }
+    }
 }
 
 /// Initialises the JWT verifier from a local PEM file or NATS KV.

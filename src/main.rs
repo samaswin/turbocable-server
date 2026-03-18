@@ -1,3 +1,10 @@
+//! turbocable-server — high-performance WebSocket gateway for TurboCable.
+//!
+//! Handles 1M+ concurrent WebSocket connections with sub-50ms fan-out latency.
+//! Uses NATS JetStream for message delivery and RS256 JWT for authentication.
+
+#![warn(missing_docs)]
+
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
@@ -28,6 +35,7 @@ async fn main() {
     server::run(cfg).await;
 }
 
+/// Attempts to raise the file descriptor limit to `target` for high connection counts.
 fn raise_fd_limit(target: u64) {
     if let Ok((soft, hard)) = rlimit::Resource::NOFILE.get() {
         if soft < target {

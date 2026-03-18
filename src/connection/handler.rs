@@ -1,3 +1,5 @@
+//! WebSocket upgrade handler and per-connection inbound/outbound loops.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,24 +19,34 @@ use crate::connection::registry::Registry;
 use crate::protocol::types::{ClientCommand, ServerMessage};
 use crate::protocol::{self, Codec, SUB_PROTOCOL_JSON, SUB_PROTOCOL_MSGPACK};
 
+/// Per-connection outbound channel capacity before back-pressure kicks in.
 const CHANNEL_CAPACITY: usize = 16;
 
+/// WebSocket close code sent when JWT authentication fails.
 const WS_CLOSE_AUTH_FAILED: u16 = 3000;
 
+/// Shared application state passed to every Axum handler.
 #[derive(Clone)]
 pub struct AppState {
+    /// Global connection registry for stream subscriptions and fan-out.
     pub registry: Arc<Registry>,
+    /// Per-IP connection rate limiter.
     pub limiter: Arc<ConnectionLimiter>,
+    /// Seconds between WebSocket ping frames.
     pub ping_interval_secs: u64,
+    /// JWT verifier (absent when auth is disabled).
     pub jwt_verifier: Option<Arc<JwtVerifier>>,
 }
 
+/// Query parameters extracted from the WebSocket upgrade URL.
 #[derive(Debug, serde::Deserialize)]
 pub struct WsQueryParams {
+    /// Optional JWT bearer token.
     #[serde(default)]
     pub token: Option<String>,
 }
 
+/// Axum handler that negotiates the WebSocket sub-protocol and upgrades the connection.
 pub async fn ws_upgrade(
     ws: WebSocketUpgrade,
     headers: HeaderMap,

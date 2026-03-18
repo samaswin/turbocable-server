@@ -1,9 +1,12 @@
+//! Binary MessagePack wire-format codec (`turbocable-v1-msgpack`).
+
 use bytes::Bytes;
 
 use crate::errors::GatewayError;
 use crate::protocol::types::{ClientCommand, ServerMessage};
 use crate::protocol::Codec;
 
+/// MessagePack codec implementing the `turbocable-v1-msgpack` sub-protocol.
 pub struct MsgpackCodec;
 
 impl Codec for MsgpackCodec {

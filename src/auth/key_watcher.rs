@@ -1,3 +1,5 @@
+//! NATS KV-based public key loading and hot-reload watcher.
+
 use std::sync::Arc;
 
 use futures::StreamExt;

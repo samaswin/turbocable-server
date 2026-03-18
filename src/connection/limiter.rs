@@ -1,3 +1,5 @@
+//! Per-IP connection rate limiting to prevent resource exhaustion.
+
 use std::net::IpAddr;
 
 use dashmap::DashMap;
@@ -12,6 +14,7 @@ pub struct ConnectionLimiter {
 }
 
 impl ConnectionLimiter {
+    /// Creates a limiter that allows up to `max_per_ip` concurrent connections per IP.
     pub fn new(max_per_ip: u64) -> Self {
         Self {
             counts: DashMap::new(),

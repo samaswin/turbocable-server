@@ -1,3 +1,5 @@
+//! Protocol message types shared between JSON and MessagePack codecs.
+
 use serde::{Deserialize, Serialize};
 
 /// Inbound commands from the WebSocket client.

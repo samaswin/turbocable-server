@@ -1,7 +1,11 @@
 [package]
-name    = "turbocable-server"
-version = "0.1.0"
-edition = "2021"
+name        = "turbocable-server"
+version     = "0.1.0"
+edition     = "2021"
+description = "High-performance WebSocket gateway for TurboCable (1M+ connections)"
+license     = "MIT"
+repository  = "https://github.com/samaswin/turbocable-server"
+rust-version = "1.78"
 
 [dependencies]
 jemallocator      = "0.5"

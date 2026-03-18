@@ -1,3 +1,5 @@
+//! WebSocket wire-format codecs: ActionCable-compatible JSON and binary MessagePack.
+
 pub mod json;
 pub mod msgpack;
 pub mod types;

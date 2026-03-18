@@ -1,23 +1,32 @@
+//! RS256 JWT verification and stream-level authorization.
+
 use std::sync::RwLock;
 
 use jsonwebtoken::{Algorithm, DecodingKey, TokenData, Validation};
 
 use crate::errors::GatewayError;
 
+/// Decoded JWT claims expected from TurboCable clients.
 #[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
 pub struct Claims {
+    /// Subject — typically a user identifier like `"user_42"`.
     pub sub: String,
+    /// Glob patterns controlling which streams the user may subscribe to.
     pub allowed_streams: Vec<String>,
+    /// Token expiry (Unix timestamp).
     pub exp: usize,
+    /// Token issued-at (Unix timestamp).
     pub iat: usize,
 }
 
+/// Thread-safe RS256 JWT verifier with hot-reloadable public key.
 pub struct JwtVerifier {
     key: RwLock<DecodingKey>,
     validation: Validation,
 }
 
 impl JwtVerifier {
+    /// Creates a new verifier from an RSA public key in PEM format.
     pub fn from_rsa_pem(pem: &[u8]) -> Result<Self, GatewayError> {
         let key = DecodingKey::from_rsa_pem(pem)
             .map_err(|e| GatewayError::Auth(format!("invalid RSA PEM: {e}")))?;
@@ -31,6 +40,7 @@ impl JwtVerifier {
         })
     }
 
+    /// Decodes and validates a JWT token, returning the claims on success.
     pub fn verify(&self, token: &str) -> Result<Claims, GatewayError> {
         let key = self
             .key
@@ -52,6 +62,7 @@ impl JwtVerifier {
         Ok(token_data.claims)
     }
 
+    /// Replaces the RSA public key at runtime for zero-downtime key rotation.
     pub fn update_key(&self, pem: &[u8]) -> Result<(), GatewayError> {
         let new_key = DecodingKey::from_rsa_pem(pem)
             .map_err(|e| GatewayError::Auth(format!("invalid RSA PEM: {e}")))?;

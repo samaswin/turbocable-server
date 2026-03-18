@@ -1,3 +1,5 @@
+//! Axum HTTP server setup, routing, and TCP listener configuration.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -11,6 +13,7 @@ use crate::connection::handler::{ws_upgrade, AppState};
 use crate::connection::limiter::ConnectionLimiter;
 use crate::connection::registry::Registry;
 
+/// Starts the gateway: builds shared state, binds the listener, and serves requests.
 pub async fn run(cfg: Config) {
     let registry = Arc::new(Registry::new());
     let limiter = Arc::new(ConnectionLimiter::new(cfg.max_connections_per_ip));
@@ -72,6 +75,7 @@ fn create_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::from_std(socket.into())
 }
 
+/// Returns a JSON health-check response with the current connection count.
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",

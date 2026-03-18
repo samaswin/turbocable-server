@@ -192,12 +192,36 @@ RUST_LOG=debug cargo run
 # Run tests
 cargo test
 
-# Lint
-cargo clippy -- -D warnings
+# Lint (all targets, deny warnings)
+cargo clippy --all-targets --all-features -- -D warnings
 
 # Format check
-cargo fmt --check
+cargo fmt --all --check
+
+# Build documentation (warnings-as-errors)
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
+
+### CI Pipeline
+
+Every push and pull request to `main` runs the following checks in GitHub Actions:
+
+| Job | What it checks |
+|-----|----------------|
+| **Formatting** | `cargo fmt --all --check` — enforces consistent style via `rustfmt.toml` |
+| **Clippy** | `cargo clippy --all-targets --all-features -- -D warnings` — catches common mistakes and anti-patterns |
+| **Tests** | `cargo test --all-features` — runs all unit and integration tests |
+| **Documentation** | `cargo doc --no-deps` with `-D warnings` — ensures all public items are documented |
+| **Security Audit** | `cargo audit` — checks dependencies for known vulnerabilities |
+| **MSRV** | `cargo check` with Rust 1.78 — verifies minimum supported Rust version |
+
+### Coding Standards
+
+- **`#![warn(missing_docs)]`** is enabled — all public types and functions must have doc comments
+- **`rustflags = ["-D", "warnings"]`** in `.cargo/config.toml` — compiler warnings are errors
+- **`rustfmt.toml`** enforces consistent formatting (100-char lines, 4-space indent)
+- **`clippy.toml`** tunes clippy lints for the project (MSRV 1.78)
+- **`.editorconfig`** ensures consistent whitespace across editors
 
 ## Project Structure
 

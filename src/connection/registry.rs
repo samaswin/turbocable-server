@@ -1,12 +1,17 @@
+//! Lock-free connection registry for million-scale WebSocket fan-out.
+
 use bytes::Bytes;
 use dashmap::DashMap;
 use smallvec::SmallVec;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
+/// Result of a fan-out operation to all subscribers of a stream.
 #[allow(dead_code)]
 pub struct FanoutResult {
+    /// Number of subscribers that accepted the message.
     pub sent: usize,
+    /// Number of subscribers whose channel was full (back-pressure).
     pub dropped: usize,
 }
 
@@ -30,6 +35,7 @@ impl Default for Registry {
 }
 
 impl Registry {
+    /// Creates a new registry pre-allocated for ~1.1M connections.
     pub fn new() -> Self {
         Self {
             senders: DashMap::with_capacity(1_100_000),
@@ -40,16 +46,19 @@ impl Registry {
         }
     }
 
+    /// Returns a monotonically increasing connection ID.
     pub fn allocate_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Registers a new connection with its outbound sender channel.
     pub fn register(&self, conn_id: u64, sender: mpsc::Sender<Bytes>) {
         self.senders.insert(conn_id, sender);
         self.conn_streams.insert(conn_id, SmallVec::new());
         self.active.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Removes a connection and cleans up all its stream subscriptions.
     pub fn deregister(&self, conn_id: u64) {
         if let Some((_, stream_list)) = self.conn_streams.remove(&conn_id) {
             for stream in stream_list {
@@ -61,6 +70,7 @@ impl Registry {
         }
     }
 
+    /// Subscribes a connection to a named stream (idempotent).
     pub fn subscribe(&self, conn_id: u64, stream: &str) {
         if let Some(mut conn_streams) = self.conn_streams.get_mut(&conn_id) {
             if conn_streams.iter().any(|s| s == stream) {
@@ -74,6 +84,7 @@ impl Registry {
         }
     }
 
+    /// Removes a connection from a stream's subscriber list.
     pub fn unsubscribe(&self, conn_id: u64, stream: &str) {
         self.remove_subscriber_from_stream(stream, conn_id);
         if let Some(mut conn_streams) = self.conn_streams.get_mut(&conn_id) {
@@ -102,6 +113,7 @@ impl Registry {
         FanoutResult { sent, dropped }
     }
 
+    /// Returns the current number of active connections.
     pub fn connection_count(&self) -> u64 {
         self.active.load(Ordering::Relaxed)
     }

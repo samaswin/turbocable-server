@@ -1,9 +1,12 @@
+//! ActionCable-compatible JSON wire-format codec (`actioncable-v1-json`).
+
 use bytes::Bytes;
 
 use crate::errors::GatewayError;
 use crate::protocol::types::{ClientCommand, ServerMessage};
 use crate::protocol::Codec;
 
+/// JSON codec implementing the `actioncable-v1-json` sub-protocol.
 pub struct JsonCodec;
 
 impl Codec for JsonCodec {

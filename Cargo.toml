@@ -5,7 +5,7 @@ edition     = "2021"
 description = "High-performance WebSocket gateway for TurboCable (1M+ connections)"
 license     = "MIT"
 repository  = "https://github.com/samaswin/turbocable-server"
-rust-version = "1.78"
+rust-version = "1.85"
 
 [dependencies]
 jemallocator      = "0.5"

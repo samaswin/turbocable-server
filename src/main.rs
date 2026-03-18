@@ -1,6 +1,7 @@
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+mod auth;
 mod config;
 mod connection;
 mod errors;

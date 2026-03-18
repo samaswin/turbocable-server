@@ -345,7 +345,7 @@ curl localhost:9292/health | jq .connections
 
 ---
 
-## Phase 5 — JWT Authentication
+## Phase 5 — JWT Authentication - Completed
 **Goal:** Verify RS256 JWT on every connection. Reject invalid tokens. Cache public key.
 **Duration:** 2 days
 **Done when:** Connection with valid JWT succeeds, expired/invalid token is rejected with close(3000).

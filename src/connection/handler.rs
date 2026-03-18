@@ -11,6 +11,7 @@ use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
+use crate::auth::jwt::{self, JwtVerifier};
 use crate::connection::limiter::ConnectionLimiter;
 use crate::connection::registry::Registry;
 use crate::protocol::types::{ClientCommand, ServerMessage};
@@ -18,11 +19,14 @@ use crate::protocol::{self, Codec, SUB_PROTOCOL_JSON, SUB_PROTOCOL_MSGPACK};
 
 const CHANNEL_CAPACITY: usize = 16;
 
+const WS_CLOSE_AUTH_FAILED: u16 = 3000;
+
 #[derive(Clone)]
 pub struct AppState {
     pub registry: Arc<Registry>,
     pub limiter: Arc<ConnectionLimiter>,
     pub ping_interval_secs: u64,
+    pub jwt_verifier: Option<Arc<JwtVerifier>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -85,19 +89,51 @@ async fn handle_socket(
         return;
     }
 
+    let allowed_streams = if let Some(ref verifier) = state.jwt_verifier {
+        let token_str = match token.as_deref() {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                tracing::warn!(%ip, "connection rejected: no token provided");
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: WS_CLOSE_AUTH_FAILED,
+                        reason: "auth failed".into(),
+                    })))
+                    .await;
+                state.limiter.release(ip);
+                return;
+            }
+        };
+
+        match verifier.verify(token_str) {
+            Ok(claims) => {
+                tracing::debug!(%ip, sub = %claims.sub, "JWT verified");
+                claims.allowed_streams
+            }
+            Err(e) => {
+                tracing::warn!(%ip, error = %e, "connection rejected: JWT verification failed");
+                let reason = e.to_string().replace("auth failed: ", "");
+                let _ = socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: WS_CLOSE_AUTH_FAILED,
+                        reason: reason.into(),
+                    })))
+                    .await;
+                state.limiter.release(ip);
+                return;
+            }
+        }
+    } else {
+        vec![String::from("*")]
+    };
+
     let codec = protocol::codec_for_protocol(protocol).expect("negotiated protocol must be valid");
 
     let conn_id = state.registry.allocate_id();
     let (tx, rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
     state.registry.register(conn_id, tx.clone());
 
-    tracing::info!(
-        conn_id,
-        %ip,
-        protocol,
-        token = token.as_deref().unwrap_or("<none>"),
-        "connection accepted"
-    );
+    tracing::info!(conn_id, %ip, protocol, "connection accepted");
 
     if let Ok(welcome) = codec.encode(&ServerMessage::Welcome) {
         let _ = tx.send(welcome).await;
@@ -108,7 +144,7 @@ async fn handle_socket(
 
     let outbound_handle = tokio::spawn(outbound_loop(rx, ws_sender, is_binary));
 
-    inbound_loop(ws_receiver, &tx, &*codec, conn_id, &state).await;
+    inbound_loop(ws_receiver, &tx, &*codec, conn_id, &state, &allowed_streams).await;
 
     state.registry.deregister(conn_id);
     state.limiter.release(ip);
@@ -150,6 +186,7 @@ async fn inbound_loop(
     codec: &dyn Codec,
     conn_id: u64,
     state: &AppState,
+    allowed_streams: &[String],
 ) {
     let mut ping_interval = tokio::time::interval(Duration::from_secs(state.ping_interval_secs));
     ping_interval.tick().await;
@@ -159,10 +196,10 @@ async fn inbound_loop(
             msg = receiver.next() => {
                 match msg {
                     Some(Ok(Message::Text(ref text))) => {
-                        handle_client_frame(text.as_bytes(), codec, conn_id, tx, state).await;
+                        handle_client_frame(text.as_bytes(), codec, conn_id, tx, state, allowed_streams).await;
                     }
                     Some(Ok(Message::Binary(ref data))) => {
-                        handle_client_frame(data, codec, conn_id, tx, state).await;
+                        handle_client_frame(data, codec, conn_id, tx, state, allowed_streams).await;
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                     Some(Ok(Message::Close(_))) | None => break,
@@ -193,12 +230,27 @@ async fn handle_client_frame(
     conn_id: u64,
     tx: &mpsc::Sender<Bytes>,
     state: &AppState,
+    allowed_streams: &[String],
 ) {
     match codec.decode(data) {
         Ok(cmd) => {
             tracing::debug!(conn_id, ?cmd, "received command");
             match cmd {
                 ClientCommand::Subscribe { identifier } => {
+                    if !jwt::is_allowed(allowed_streams, &identifier) {
+                        tracing::warn!(
+                            conn_id,
+                            identifier,
+                            "subscribe rejected: stream not allowed"
+                        );
+                        if let Ok(reject) =
+                            codec.encode(&ServerMessage::RejectSubscription { identifier })
+                        {
+                            let _ = tx.send(reject).await;
+                        }
+                        return;
+                    }
+
                     state.registry.subscribe(conn_id, &identifier);
                     if let Ok(confirm) =
                         codec.encode(&ServerMessage::ConfirmSubscription { identifier })

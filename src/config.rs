@@ -21,6 +21,9 @@ pub struct Config {
 
     #[arg(long, env = "TURBOCABLE_MAX_CONN_PER_IP", default_value = "10")]
     pub max_connections_per_ip: u64,
+
+    #[arg(long, env = "TURBOCABLE_JWT_PUBLIC_KEY_PATH")]
+    pub jwt_public_key_path: Option<String>,
 }
 
 fn default_node_id() -> String {

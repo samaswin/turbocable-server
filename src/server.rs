@@ -4,6 +4,8 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::{routing::get, Json, Router};
 
+use crate::auth::jwt::JwtVerifier;
+use crate::auth::key_watcher;
 use crate::config::Config;
 use crate::connection::handler::{ws_upgrade, AppState};
 use crate::connection::limiter::ConnectionLimiter;
@@ -13,10 +15,13 @@ pub async fn run(cfg: Config) {
     let registry = Arc::new(Registry::new());
     let limiter = Arc::new(ConnectionLimiter::new(cfg.max_connections_per_ip));
 
+    let jwt_verifier = init_jwt_verifier(&cfg).await;
+
     let state = AppState {
         registry: registry.clone(),
         limiter,
         ping_interval_secs: cfg.ping_interval_secs,
+        jwt_verifier,
     };
 
     let app = Router::new()
@@ -73,4 +78,56 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "connections": state.registry.connection_count(),
     }))
+}
+
+/// Initialises the JWT verifier from a local PEM file or NATS KV.
+///
+/// Priority:
+///   1. `TURBOCABLE_JWT_PUBLIC_KEY_PATH` env/arg → load from file
+///   2. Otherwise → attempt NATS KV bucket `TC_PUBKEYS`
+///   3. If neither is available → run without auth (warning logged)
+async fn init_jwt_verifier(cfg: &Config) -> Option<Arc<JwtVerifier>> {
+    if let Some(ref path) = cfg.jwt_public_key_path {
+        let pem = match tokio::fs::read(path).await {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!(path, error = %e, "failed to read JWT public key file");
+                std::process::exit(1);
+            }
+        };
+
+        let verifier = match JwtVerifier::from_rsa_pem(&pem) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(path, error = %e, "invalid JWT public key");
+                std::process::exit(1);
+            }
+        };
+
+        let verifier = Arc::new(verifier);
+        tracing::info!(path, "JWT auth enabled (key loaded from file)");
+
+        if let Err(e) = key_watcher::start_nats_key_watcher(&cfg.nats_url, verifier.clone()).await {
+            tracing::info!(
+                error = %e,
+                "NATS KV key watcher not available (file key will be used)"
+            );
+        }
+
+        return Some(verifier);
+    }
+
+    match key_watcher::load_and_watch_from_nats(&cfg.nats_url).await {
+        Ok(verifier) => {
+            tracing::info!("JWT auth enabled (key loaded from NATS KV, watcher active)");
+            Some(verifier)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "JWT auth DISABLED — set TURBOCABLE_JWT_PUBLIC_KEY_PATH or configure NATS KV"
+            );
+            None
+        }
+    }
 }

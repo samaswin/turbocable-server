@@ -28,6 +28,9 @@ uuid              = { version = "1", features = ["v4", "fast-rng"] }
 num_cpus          = "1"
 socket2           = { version = "0.5", features = ["all"] }
 rlimit            = "0.10"
+time              = ">=0.3.0, <0.3.37"
+time-core         = ">=0.1.0, <0.1.3"
+time-macros       = ">=0.2.0, <0.2.19"
 
 [dependencies.futures]
 version = "0.3"

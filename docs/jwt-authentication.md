@@ -298,6 +298,24 @@ Send subscribe commands inside the wscat session:
 → {"type":"reject_subscription","identifier":"admin_panel"}
 ```
 
+### Step 5b: Test NATS fan-out with auth
+
+With NATS running and the client subscribed to `chat_room_42`:
+
+```bash
+# In another terminal
+nats pub TURBOCABLE.chat_room_42 '{"text":"hello with auth"}'
+```
+
+The wscat client should receive:
+
+```json
+{"type":"message","identifier":"chat_room_42","message":{"text":"hello with auth"},"seq":1}
+```
+
+See [NATS JetStream Integration](nats-jetstream.md) for full fan-out and
+replay testing instructions.
+
 ### Step 6: Test with restricted token
 
 ```bash

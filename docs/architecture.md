@@ -172,9 +172,10 @@ Client connects: GET /cable?token=<JWT>
   │
   ├─ Spawn outbound task: mpsc → WebSocket writes
   ├─ Run inbound loop:
-  │     subscribe   → check allowed_streams → confirm or reject
+  │     subscribe   → check allowed_streams → replay if reconnect → confirm or reject
   │     unsubscribe → remove from registry
-  │     message     → forward to NATS (Phase 6)
+  │     message     → publish to NATS JetStream (TURBOCABLE.{identifier})
+  │     hello       → store last_seq for replay on next subscribe
   │     ping        → periodic server-initiated pings
   │
   └─ On close/error:
@@ -186,23 +187,40 @@ Client connects: GET /cable?token=<JWT>
 ### Fan-out hot path (zero allocation)
 
 ```rust
-// 1 NATS message arrives
+// 1 NATS message arrives from JetStream
 // → strip "TURBOCABLE." prefix → stream_name
-// → registry.fanout(stream_name, frame)
+// → pre-encode as both JSON and MessagePack (one encoding per codec)
+// → registry.fanout_encoded(stream_name, json_bytes, msgpack_bytes)
 
-fn fanout(&self, stream: &str, frame: Bytes) {
+fn fanout_encoded(&self, stream: &str, json: Bytes, msgpack: Bytes) {
     // DashMap shard lock held for microseconds
-    let targets = self.streams.get(stream).clone();
-    // Lock released
+    let targets = self.streams.get(stream);
 
     for conn_id in targets {
+        let payload = if conn.is_binary { msgpack.clone() } else { json.clone() };
         // Bytes::clone() = 1 atomic refcount increment (~1ns)
         // try_send = non-blocking, never allocates
-        tx.try_send(frame.clone());
+        conn.sender.try_send(payload);
         // If channel full → skip (slow client protection)
     }
 }
 ```
+
+### Message replay on reconnect
+
+When a client reconnects and sends `{"type":"hello","last_seq":"8841"}`,
+the gateway replays missed messages for each stream the client subscribes to:
+
+```
+Client reconnects → sends hello with last_seq
+  → subscribes to "chat_room_42"
+  → gateway creates ephemeral JetStream consumer at seq 8842
+  → delivers missed messages with replayed: true
+  → sends confirm_subscription
+  → live delivery resumes (via the durable consumer)
+```
+
+See [NATS JetStream Integration](nats-jetstream.md) for full details.
 
 ---
 

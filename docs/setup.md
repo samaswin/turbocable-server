@@ -16,6 +16,7 @@ locally.
 - [Configuration Reference](#configuration-reference)
 - [Development Tools](#development-tools)
 - [Verifying the Setup](#verifying-the-setup)
+- [Related Documentation](#related-documentation)
 
 ---
 
@@ -221,6 +222,8 @@ All options can be set via environment variables or CLI arguments.
 | `TURBOCABLE_PING_INTERVAL` | `--ping-interval-secs` | `30` | WebSocket ping interval in seconds |
 | `TURBOCABLE_MAX_CONN_PER_IP` | `--max-connections-per-ip` | `10` | Maximum concurrent connections per IP address |
 | `TURBOCABLE_JWT_PUBLIC_KEY_PATH` | `--jwt-public-key-path` | _(none)_ | Path to RSA public key PEM file for JWT verification |
+| `TURBOCABLE_MAX_ACK_PENDING` | `--max-ack-pending` | `10000` | Max unacknowledged NATS JetStream messages (back-pressure) |
+| `TURBOCABLE_NATS_STREAM_REPLICAS` | `--nats-stream-replicas` | `1` | JetStream stream replica count (use 3 in production) |
 | `RUST_LOG` | — | `info` | Log level filter (`error`, `warn`, `info`, `debug`, `trace`) |
 
 ### Example: full configuration
@@ -232,6 +235,8 @@ TURBOCABLE_NODE_ID=gateway-01 \
 TURBOCABLE_PING_INTERVAL=30 \
 TURBOCABLE_MAX_CONN_PER_IP=10 \
 TURBOCABLE_JWT_PUBLIC_KEY_PATH=/etc/turbocable/public_key.pem \
+TURBOCABLE_MAX_ACK_PENDING=10000 \
+TURBOCABLE_NATS_STREAM_REPLICAS=1 \
 RUST_LOG=info \
 cargo run --release
 ```
@@ -358,4 +363,58 @@ nats server check
 ```
 
 > If NATS is not running, the server still starts — auth falls back to
-> file-based key or runs without auth. A warning is logged.
+> file-based key or runs without auth, and pub/sub is disabled. Warnings
+> are logged.
+
+### 7. NATS JetStream fan-out works
+
+With NATS running and the gateway started:
+
+```bash
+# Terminal A: connect a WebSocket client
+wscat -c ws://localhost:9292/cable
+# After receiving {"type":"welcome"}, subscribe:
+# > {"command":"subscribe","identifier":"chat_room_1"}
+# Should receive: {"type":"confirm_subscription","identifier":"chat_room_1"}
+
+# Terminal B: publish a NATS message
+nats pub TURBOCABLE.chat_room_1 '{"text":"hello from NATS"}'
+```
+
+Terminal A should immediately receive:
+
+```json
+{"type":"message","identifier":"chat_room_1","message":{"text":"hello from NATS"},"seq":1}
+```
+
+### 8. NATS stream was created
+
+```bash
+nats stream info TURBOCABLE
+```
+
+Should show the stream configuration (subjects, storage type, replicas) and
+current message count.
+
+### 9. Message replay works
+
+```bash
+# Disconnect wscat (Ctrl+C), then publish while disconnected:
+nats pub TURBOCABLE.chat_room_1 '{"text":"missed message"}'
+
+# Reconnect:
+wscat -c ws://localhost:9292/cable
+# > {"type":"hello","last_seq":"1"}
+# > {"command":"subscribe","identifier":"chat_room_1"}
+# Should receive the missed message with "replayed":true before confirm
+```
+
+See [NATS JetStream Integration](nats-jetstream.md) for full details.
+
+---
+
+## Related Documentation
+
+- [Architecture Overview](architecture.md) — system design, data flow, and capacity planning
+- [JWT Authentication](jwt-authentication.md) — token format, key rotation, and auth testing
+- [NATS JetStream Integration](nats-jetstream.md) — fan-out pipeline, replay, and NATS configuration

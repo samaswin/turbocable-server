@@ -194,36 +194,182 @@ If NATS is unavailable on startup:
 
 ## Testing
 
-### Manual integration test
+### Prerequisites
+
+- `nats-server` with JetStream support (`brew install nats-server`)
+- `nats` CLI (`brew install nats-io/nats-tools/nats`)
+- `wscat` (`npm install -g wscat`)
+
+### Test 1: Basic NATS fan-out (no auth)
+
+Open 4 terminal windows.
+
+**Terminal 1 — Start NATS:**
 
 ```bash
-# Terminal 1: Start NATS with JetStream
 nats-server --jetstream
-
-# Terminal 2: Start the gateway
-RUST_LOG=debug cargo run
-
-# Terminal 3: Connect a WebSocket client
-wscat -c 'ws://localhost:9292/cable?token=<valid_jwt>'
-# Send: {"command":"subscribe","identifier":"chat_room_1"}
-
-# Terminal 4: Publish a message
-nats pub TURBOCABLE.chat_room_1 '{"message":"hello from NATS"}'
-# Terminal 3 should receive the message
 ```
 
-### Replay test
+Wait for `JetStream is ready` in the output.
+
+**Terminal 2 — Start the gateway:**
 
 ```bash
-# Publish messages while the client is disconnected
-nats pub TURBOCABLE.chat_room_1 '{"message":"missed 1"}'
-nats pub TURBOCABLE.chat_room_1 '{"message":"missed 2"}'
-
-# Reconnect the client with last_seq from before disconnect
-# Send: {"type":"hello","last_seq":"<last_known_seq>"}
-# Send: {"command":"subscribe","identifier":"chat_room_1"}
-# Client should receive both missed messages with replayed: true
+cd /path/to/turbocable-server
+RUST_LOG=debug cargo run
 ```
+
+Watch for these log lines:
+- `"NATS JetStream stream ready"` — stream created/verified
+- `"NATS durable consumer started"` — consumer is pulling
+- `"listening on 0.0.0.0:9292"` — ready for connections
+
+**Terminal 3 — Connect a WebSocket client:**
+
+```bash
+wscat -c ws://localhost:9292/cable
+```
+
+You should receive `{"type":"welcome"}`. Now subscribe:
+
+```
+{"command":"subscribe","identifier":"chat_room_1"}
+```
+
+Expected response: `{"type":"confirm_subscription","identifier":"chat_room_1"}`
+
+**Terminal 4 — Publish a message via NATS:**
+
+```bash
+nats pub TURBOCABLE.chat_room_1 '{"text":"hello from NATS!"}'
+```
+
+**Terminal 3** should immediately show:
+
+```json
+{"type":"message","identifier":"chat_room_1","message":{"text":"hello from NATS!"},"seq":1}
+```
+
+The `seq` field is the JetStream stream sequence number.
+
+### Test 2: Message replay on reconnect
+
+1. Note the last `seq` you received in Terminal 3 (e.g., `1`).
+
+2. **Disconnect** the wscat client (Ctrl+C).
+
+3. **Publish messages while client is disconnected** (Terminal 4):
+
+```bash
+nats pub TURBOCABLE.chat_room_1 '{"text":"missed message 1"}'
+nats pub TURBOCABLE.chat_room_1 '{"text":"missed message 2"}'
+nats pub TURBOCABLE.chat_room_1 '{"text":"missed message 3"}'
+```
+
+4. **Reconnect** (Terminal 3):
+
+```bash
+wscat -c ws://localhost:9292/cable
+```
+
+5. **Send hello with last_seq, then subscribe:**
+
+```
+{"type":"hello","last_seq":"1"}
+{"command":"subscribe","identifier":"chat_room_1"}
+```
+
+6. You should receive the 3 missed messages with `"replayed":true` before
+   the subscription confirmation:
+
+```json
+{"type":"message","identifier":"chat_room_1","message":{"text":"missed message 1"},"replayed":true,"seq":2}
+{"type":"message","identifier":"chat_room_1","message":{"text":"missed message 2"},"replayed":true,"seq":3}
+{"type":"message","identifier":"chat_room_1","message":{"text":"missed message 3"},"replayed":true,"seq":4}
+{"type":"confirm_subscription","identifier":"chat_room_1"}
+```
+
+### Test 3: Client-to-NATS publishing
+
+With a wscat client connected and subscribed to `chat_room_1`, send a
+message command:
+
+```
+{"command":"message","identifier":"chat_room_1","data":"{\"action\":\"speak\",\"text\":\"hello from client\"}"}
+```
+
+Since the message is published to `TURBOCABLE.chat_room_1` via JetStream,
+you will receive it back (the sender also gets the broadcast, matching
+ActionCable behavior).
+
+### Test 4: Multiple streams
+
+Subscribe to multiple streams and verify each receives only its own
+messages:
+
+```
+{"command":"subscribe","identifier":"chat_room_1"}
+{"command":"subscribe","identifier":"notifications"}
+```
+
+```bash
+# Terminal 4:
+nats pub TURBOCABLE.chat_room_1 '{"text":"chat message"}'
+nats pub TURBOCABLE.notifications '{"text":"new notification"}'
+```
+
+Each message should arrive with the correct `identifier`.
+
+### Test 5: Health check shows active connections
+
+```bash
+curl -s localhost:9292/health | jq .
+```
+
+Expected (with one wscat client connected):
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0",
+  "connections": 1
+}
+```
+
+### Test 6: Verify NATS stream state
+
+```bash
+nats stream info TURBOCABLE
+```
+
+Shows stream config (subjects, storage, replicas) and current message
+count/bytes.
+
+### Test 7: With JWT authentication
+
+See [JWT Authentication — Manual Testing](jwt-authentication.md#manual-testing)
+for generating test tokens. When auth is enabled, add the token to the
+WebSocket URL:
+
+```bash
+wscat -c "ws://localhost:9292/cable?token=$VALID_TOKEN"
+```
+
+All fan-out and replay behavior works identically — the token only controls
+which streams the client is allowed to subscribe to.
+
+### Quick reference checklist
+
+| # | Test | Expected |
+|---|------|----------|
+| 1 | NATS publish → wscat receives | Message with `seq` field |
+| 2 | Disconnect → publish → reconnect with `last_seq` | Replayed messages with `"replayed":true` |
+| 3 | Client sends message command | Published to NATS, echoed back |
+| 4 | Multiple streams | Each receives only its own messages |
+| 5 | Health endpoint | Shows correct connection count |
+| 6 | `nats stream info TURBOCABLE` | Stream exists with correct config |
+| 7 | Gateway starts without NATS | Warns, runs without pub/sub |
+| 8 | NATS stops while gateway is running | Consumer auto-reconnects when NATS returns |
 
 ---
 

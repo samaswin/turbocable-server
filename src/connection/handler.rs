@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Query, State};
@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use crate::auth::jwt::{self, JwtVerifier};
 use crate::connection::limiter::ConnectionLimiter;
 use crate::connection::registry::Registry;
+use crate::metrics::Metrics;
 use crate::protocol::types::{ClientCommand, ServerMessage};
 use crate::protocol::{self, Codec, SUB_PROTOCOL_JSON, SUB_PROTOCOL_MSGPACK};
 use crate::pubsub::nats::NatsConsumer;
@@ -39,6 +40,8 @@ pub struct AppState {
     pub jwt_verifier: Option<Arc<JwtVerifier>>,
     /// NATS JetStream consumer for publishing and replay (absent when NATS is unavailable).
     pub nats_consumer: Option<Arc<NatsConsumer>>,
+    /// Prometheus metrics handle.
+    pub metrics: Arc<Metrics>,
 }
 
 /// Query parameters extracted from the WebSocket upgrade URL.
@@ -105,6 +108,7 @@ async fn handle_socket(
 
     if !state.limiter.try_acquire(ip) {
         tracing::warn!(%ip, "connection rejected: per-IP limit exceeded");
+        state.metrics.connections_rejected.inc();
         let _ = socket
             .send(Message::Close(Some(CloseFrame {
                 code: 1008,
@@ -119,6 +123,7 @@ async fn handle_socket(
             Some(t) if !t.is_empty() => t,
             _ => {
                 tracing::warn!(%ip, "connection rejected: no token provided");
+                state.metrics.connections_rejected.inc();
                 let _ = socket
                     .send(Message::Close(Some(CloseFrame {
                         code: WS_CLOSE_AUTH_FAILED,
@@ -130,13 +135,21 @@ async fn handle_socket(
             }
         };
 
-        match verifier.verify(token_str) {
+        let t0 = Instant::now();
+        let result = verifier.verify(token_str);
+        state
+            .metrics
+            .auth_duration_secs
+            .observe(t0.elapsed().as_secs_f64());
+
+        match result {
             Ok(claims) => {
                 tracing::debug!(%ip, sub = %claims.sub, "JWT verified");
                 claims.allowed_streams
             }
             Err(e) => {
                 tracing::warn!(%ip, error = %e, "connection rejected: JWT verification failed");
+                state.metrics.connections_rejected.inc();
                 let reason = e.to_string().replace("auth failed: ", "");
                 let _ = socket
                     .send(Message::Close(Some(CloseFrame {
@@ -158,6 +171,9 @@ async fn handle_socket(
     let conn_id = state.registry.allocate_id();
     let (tx, rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
     state.registry.register(conn_id, tx.clone(), is_binary);
+
+    state.metrics.connections_total.inc();
+    state.metrics.connections_active.inc();
 
     tracing::info!(conn_id, %ip, protocol, "connection accepted");
 
@@ -181,6 +197,7 @@ async fn handle_socket(
     .await;
 
     state.registry.deregister(conn_id);
+    state.metrics.connections_active.dec();
     state.limiter.release(ip);
     drop(tx);
     let _ = outbound_handle.await;

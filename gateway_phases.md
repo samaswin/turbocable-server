@@ -409,7 +409,7 @@ Fallback: accept `TURBOCABLE_JWT_PUBLIC_KEY_PATH` env var for local dev
 
 ---
 
-## Phase 6 — NATS JetStream Integration
+## Phase 6 — NATS JetStream Integration - Completed
 **Goal:** Gateway consumes from NATS and fans out to subscribers.
 **This is the core of the whole product.**
 **Duration:** 3–4 days
@@ -498,9 +498,9 @@ Used by Rails to verify it and the gateway are in sync during debugging.
 
 ### 7.3 Phase 7 Checklist
 - [ ] All metrics increment correctly under manual testing
-- [ ] `/metrics` returns valid Prometheus format (test with `promtool check metrics`)
-- [ ] Grafana dashboard JSON template committed to `infra/grafana/`
-- [ ] Alert rules defined: connections_active > 900k, fanout p99 > 100ms
+- [x] `/metrics` returns valid Prometheus format (test with `promtool check metrics`)
+- [x] Grafana dashboard JSON template committed to `infra/grafana/`
+- [x] Alert rules defined: connections_active > 900k, fanout p99 > 100ms
 
 ---
 

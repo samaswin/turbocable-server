@@ -22,6 +22,7 @@ pub struct Claims {
 /// Thread-safe RS256 JWT verifier with hot-reloadable public key.
 pub struct JwtVerifier {
     key: RwLock<DecodingKey>,
+    pem: RwLock<Vec<u8>>,
     validation: Validation,
 }
 
@@ -36,8 +37,17 @@ impl JwtVerifier {
 
         Ok(Self {
             key: RwLock::new(key),
+            pem: RwLock::new(pem.to_vec()),
             validation,
         })
+    }
+
+    /// Returns the current RSA public key in PEM format.
+    pub fn current_pem(&self) -> Vec<u8> {
+        self.pem
+            .read()
+            .map(|g| g.to_vec())
+            .unwrap_or_default()
     }
 
     /// Decodes and validates a JWT token, returning the claims on success.
@@ -72,6 +82,10 @@ impl JwtVerifier {
             .write()
             .map_err(|_| GatewayError::Auth("lock poisoned".into()))?;
         *key = new_key;
+
+        if let Ok(mut pem_guard) = self.pem.write() {
+            *pem_guard = pem.to_vec();
+        }
 
         tracing::info!("JWT public key updated");
         Ok(())

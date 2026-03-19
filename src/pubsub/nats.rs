@@ -24,13 +24,14 @@
 //! fetches missed messages in order, delivered with `replayed: true`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt;
 
 use crate::connection::registry::Registry;
 use crate::errors::GatewayError;
+use crate::metrics::Metrics;
 use crate::protocol::types::ServerMessage;
 
 /// NATS subject prefix: all TurboCable broadcasts live under `TURBOCABLE.{stream_name}`.
@@ -47,9 +48,6 @@ const REPLAY_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Delay before retrying after a NATS consumer error.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
-
-/// Seconds between consumer lag check log entries (used to derive message-count threshold).
-const LAG_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
 /// A message fetched from JetStream for replay delivery.
 pub struct ReplayMessage {
@@ -117,11 +115,12 @@ impl NatsConsumer {
         node_id: String,
         registry: Arc<Registry>,
         max_ack_pending: i64,
+        metrics: Arc<Metrics>,
     ) {
         let consumer = Arc::clone(self);
         tokio::spawn(async move {
             consumer
-                .fanout_loop(&node_id, &registry, max_ack_pending)
+                .fanout_loop(&node_id, &registry, max_ack_pending, &metrics)
                 .await;
         });
     }
@@ -224,9 +223,18 @@ impl NatsConsumer {
     }
 
     /// Outer reconnection loop: re-creates the consumer on any error.
-    async fn fanout_loop(&self, node_id: &str, registry: &Registry, max_ack_pending: i64) {
+    async fn fanout_loop(
+        &self,
+        node_id: &str,
+        registry: &Registry,
+        max_ack_pending: i64,
+        metrics: &Metrics,
+    ) {
         loop {
-            match self.run_consumer(node_id, registry, max_ack_pending).await {
+            match self
+                .run_consumer(node_id, registry, max_ack_pending, metrics)
+                .await
+            {
                 Ok(()) => {
                     tracing::warn!("NATS consumer stream ended, reconnecting");
                 }
@@ -249,6 +257,7 @@ impl NatsConsumer {
         node_id: &str,
         registry: &Registry,
         max_ack_pending: i64,
+        metrics: &Metrics,
     ) -> Result<(), GatewayError> {
         let stream = self
             .jetstream
@@ -276,8 +285,7 @@ impl NatsConsumer {
             "NATS durable consumer started"
         );
 
-        // Log initial consumer state for observability.
-        log_consumer_lag(&mut consumer).await;
+        update_consumer_lag(&mut consumer, metrics).await;
 
         let mut messages = consumer
             .messages()
@@ -285,13 +293,12 @@ impl NatsConsumer {
             .map_err(|e| GatewayError::JetStream(format!("messages stream: {e}")))?;
 
         let mut processed: u64 = 0;
-        let lag_check_interval = LAG_CHECK_INTERVAL.as_secs();
 
         while let Some(result) = messages.next().await {
             let msg = result
                 .map_err(|e| GatewayError::JetStream(format!("consumer message error: {e}")))?;
 
-            process_nats_message(&msg, registry);
+            process_nats_message(&msg, registry, metrics);
 
             if let Err(e) = msg.ack().await {
                 tracing::warn!(error = %e, "NATS ack failed");
@@ -299,13 +306,9 @@ impl NatsConsumer {
 
             processed += 1;
 
-            // Periodic progress logging (Phase 7 will replace with Prometheus gauges).
-            if processed % (lag_check_interval * 1000) == 0 {
-                tracing::info!(
-                    consumer = %consumer_name,
-                    messages_processed = processed,
-                    "consumer progress"
-                );
+            // Refresh consumer lag gauge every 10k messages.
+            if processed % 10_000 == 0 {
+                update_consumer_lag(&mut consumer, metrics).await;
             }
         }
 
@@ -327,9 +330,13 @@ fn extract_stream_sequence(msg: &async_nats::jetstream::Message) -> u64 {
     msg.info().map(|info| info.stream_sequence).unwrap_or(0)
 }
 
-/// Decodes a NATS message, pre-encodes it for both wire formats, and fans out
-/// to all WebSocket subscribers of the target stream.
-fn process_nats_message(msg: &async_nats::jetstream::Message, registry: &Registry) {
+/// Decodes a NATS message, pre-encodes it for both wire formats, fans out
+/// to all WebSocket subscribers, and records fan-out metrics.
+fn process_nats_message(
+    msg: &async_nats::jetstream::Message,
+    registry: &Registry,
+    metrics: &Metrics,
+) {
     let subject = msg.subject.as_str();
     let stream_name = extract_stream_name(subject);
     let sequence = extract_stream_sequence(msg);
@@ -355,9 +362,21 @@ fn process_nats_message(msg: &async_nats::jetstream::Message, registry: &Registr
         .map(Bytes::from)
         .unwrap_or_default();
 
+    let t0 = Instant::now();
     let result = registry.fanout_encoded(stream_name, json_bytes, msgpack_bytes);
+    metrics
+        .fanout_duration_secs
+        .observe(t0.elapsed().as_secs_f64());
 
+    if result.sent > 0 {
+        metrics
+            .messages_fanned_out
+            .inc_by(result.sent as u64);
+    }
     if result.dropped > 0 {
+        metrics
+            .messages_dropped
+            .inc_by(result.dropped as u64);
         tracing::debug!(
             stream = stream_name,
             seq = sequence,
@@ -368,19 +387,22 @@ fn process_nats_message(msg: &async_nats::jetstream::Message, registry: &Registr
     }
 }
 
-/// Fetches consumer info from NATS and logs the pending message count.
-/// This will be replaced by Prometheus gauge updates in Phase 7.
-async fn log_consumer_lag(
+/// Fetches consumer info and updates the `nats_consumer_lag` Prometheus gauge.
+async fn update_consumer_lag(
     consumer: &mut async_nats::jetstream::consumer::Consumer<
         async_nats::jetstream::consumer::pull::Config,
     >,
+    metrics: &Metrics,
 ) {
     match consumer.info().await {
         Ok(info) => {
-            tracing::info!(
+            metrics
+                .nats_consumer_lag
+                .set(info.num_pending as i64);
+            tracing::debug!(
                 num_pending = info.num_pending,
                 num_ack_pending = info.num_ack_pending,
-                "nats_consumer_lag"
+                "nats_consumer_lag updated"
             );
         }
         Err(e) => {

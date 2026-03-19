@@ -134,6 +134,8 @@ All options can be set via CLI flags or environment variables:
 | Path | Description |
 |------|-------------|
 | `GET /health` | Health check — returns `{"status":"ok","connections":N}` |
+| `GET /metrics` | Prometheus metrics in text exposition format |
+| `GET /pubkey` | Current RS256 public key PEM (for debugging key sync with Rails) |
 | `GET /cable` | WebSocket upgrade endpoint (pass `?token=<JWT>` when auth is enabled) |
 
 ## WebSocket Protocol
@@ -290,8 +292,7 @@ src/
 │   └── msgpack.rs          # Binary codec (rmp-serde)
 ├── pubsub/
 │   └── nats.rs             # NATS JetStream consumer, fan-out, publish, replay
-└── metrics/
-    └── mod.rs              # Prometheus metrics (stub)
+└── metrics.rs              # Prometheus metrics — counters, gauges, histograms, /metrics handler
 ```
 
 ## Documentation

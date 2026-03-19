@@ -4,6 +4,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::{routing::get, Json, Router};
 
 use crate::auth::jwt::JwtVerifier;
@@ -12,15 +14,17 @@ use crate::config::Config;
 use crate::connection::handler::{ws_upgrade, AppState};
 use crate::connection::limiter::ConnectionLimiter;
 use crate::connection::registry::Registry;
+use crate::metrics::Metrics;
 use crate::pubsub::nats::NatsConsumer;
 
 /// Starts the gateway: builds shared state, binds the listener, and serves requests.
 pub async fn run(cfg: Config) {
+    let metrics = Metrics::new();
     let registry = Arc::new(Registry::new());
     let limiter = Arc::new(ConnectionLimiter::new(cfg.max_connections_per_ip));
 
     let jwt_verifier = init_jwt_verifier(&cfg).await;
-    let nats_consumer = init_nats_consumer(&cfg, &registry).await;
+    let nats_consumer = init_nats_consumer(&cfg, &registry, Arc::clone(&metrics)).await;
 
     let state = AppState {
         registry: registry.clone(),
@@ -28,10 +32,13 @@ pub async fn run(cfg: Config) {
         ping_interval_secs: cfg.ping_interval_secs,
         jwt_verifier,
         nats_consumer,
+        metrics,
     };
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_handler))
+        .route("/pubkey", get(pubkey_handler))
         .route("/cable", get(ws_upgrade))
         .with_state(state);
 
@@ -87,10 +94,44 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
+/// Returns all gateway metrics in Prometheus text exposition format.
+async fn metrics_handler() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        Metrics::render(),
+    )
+}
+
+/// Returns the current RS256 public key PEM used for JWT verification.
+///
+/// Used by Rails to confirm the gateway is using the expected key during debugging.
+/// Returns 404 if JWT auth is disabled.
+async fn pubkey_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.jwt_verifier {
+        Some(ref verifier) => {
+            let pem = verifier.current_pem();
+            match String::from_utf8(pem) {
+                Ok(pem_str) => (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/x-pem-file")],
+                    pem_str,
+                )
+                    .into_response(),
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Connects to NATS, ensures the JetStream stream, and starts the background
 /// fan-out consumer loop. Returns `None` if NATS is unavailable (gateway runs
 /// without pub/sub — useful for local development and testing).
-async fn init_nats_consumer(cfg: &Config, registry: &Arc<Registry>) -> Option<Arc<NatsConsumer>> {
+async fn init_nats_consumer(
+    cfg: &Config,
+    registry: &Arc<Registry>,
+    metrics: Arc<Metrics>,
+) -> Option<Arc<NatsConsumer>> {
     match NatsConsumer::connect(&cfg.nats_url, cfg.nats_stream_replicas).await {
         Ok(consumer) => {
             let consumer = Arc::new(consumer);
@@ -98,6 +139,7 @@ async fn init_nats_consumer(cfg: &Config, registry: &Arc<Registry>) -> Option<Ar
                 cfg.node_id.clone(),
                 Arc::clone(registry),
                 cfg.max_ack_pending,
+                metrics,
             );
             tracing::info!(
                 nats_url = %cfg.nats_url,

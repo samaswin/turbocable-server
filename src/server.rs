@@ -2,11 +2,13 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{routing::get, Json, Router};
+use tokio::sync::watch;
 
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::key_watcher;
@@ -17,7 +19,19 @@ use crate::connection::registry::Registry;
 use crate::metrics::Metrics;
 use crate::pubsub::nats::NatsConsumer;
 
+/// Maximum time in seconds to wait for WebSocket connections to drain after SIGTERM.
+const DRAIN_TIMEOUT_SECS: u64 = 30;
+
+/// How often to poll the connection count while draining.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Starts the gateway: builds shared state, binds the listener, and serves requests.
+///
+/// On SIGTERM (or Ctrl-C in dev), the server:
+/// 1. Stops accepting new connections.
+/// 2. Signals all active WebSocket connections to close with code 1001.
+/// 3. Waits up to `DRAIN_TIMEOUT_SECS` for connections to close gracefully.
+/// 4. Flushes any pending NATS acks.
 pub async fn run(cfg: Config) {
     let metrics = Metrics::new();
     let registry = Arc::new(Registry::new());
@@ -26,13 +40,16 @@ pub async fn run(cfg: Config) {
     let jwt_verifier = init_jwt_verifier(&cfg).await;
     let nats_consumer = init_nats_consumer(&cfg, &registry, Arc::clone(&metrics)).await;
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     let state = AppState {
         registry: registry.clone(),
         limiter,
         ping_interval_secs: cfg.ping_interval_secs,
         jwt_verifier,
-        nats_consumer,
+        nats_consumer: nats_consumer.clone(),
         metrics,
+        shutdown_rx,
     };
 
     let app = Router::new()
@@ -56,11 +73,60 @@ pub async fn run(cfg: Config) {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await
     .unwrap_or_else(|e| {
         tracing::error!("server error: {e}");
         std::process::exit(1);
     });
+
+    // Axum has stopped accepting new connections. Signal all active WebSocket
+    // connections to send a close(1001) frame and drain.
+    let active = registry.connection_count();
+    tracing::info!(active, "draining connections (up to {DRAIN_TIMEOUT_SECS}s)");
+    let _ = shutdown_tx.send(true);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(DRAIN_TIMEOUT_SECS);
+    loop {
+        let remaining = registry.connection_count();
+        if remaining == 0 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(remaining, "drain timeout: force-closing remaining connections");
+            break;
+        }
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    }
+
+    // Flush any pending NATS publishes and acks before exiting.
+    if let Some(ref consumer) = nats_consumer {
+        if let Err(e) = consumer.flush().await {
+            tracing::warn!(error = %e, "NATS flush failed during shutdown");
+        } else {
+            tracing::info!("NATS flushed");
+        }
+    }
+
+    tracing::info!("shutdown complete");
+}
+
+/// Returns a future that resolves when SIGTERM or Ctrl-C is received.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = sigterm.recv() => { tracing::info!("SIGTERM received"); }
+            _ = tokio::signal::ctrl_c() => { tracing::info!("Ctrl-C received"); }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("Ctrl-C received");
+    }
 }
 
 /// Creates a TCP listener with `SO_REUSEPORT` and `SO_REUSEADDR` via socket2,

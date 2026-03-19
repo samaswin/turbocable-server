@@ -178,10 +178,15 @@ Client connects: GET /cable?token=<JWT>
   │     hello       → store last_seq for replay on next subscribe
   │     ping        → periodic server-initiated pings
   │
-  └─ On close/error:
+  └─ On close/error/shutdown:
        unsubscribe all streams
        deregister from registry
        release per-IP limiter slot
+
+       SIGTERM path:
+         outbound task receives shutdown watch → drains queue → sends close(1001)
+         inbound loop receives shutdown watch → breaks
+         server waits up to 30s for count → 0, then flushes NATS
 ```
 
 ### Fan-out hot path (zero allocation)

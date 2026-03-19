@@ -418,3 +418,4 @@ See [NATS JetStream Integration](nats-jetstream.md) for full details.
 - [Architecture Overview](architecture.md) — system design, data flow, and capacity planning
 - [JWT Authentication](jwt-authentication.md) — token format, key rotation, and auth testing
 - [NATS JetStream Integration](nats-jetstream.md) — fan-out pipeline, replay, and NATS configuration
+- [Graceful Shutdown](graceful-shutdown.md) — SIGTERM handling, drain testing, Kubernetes configuration

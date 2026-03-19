@@ -11,7 +11,7 @@ use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::auth::jwt::{self, JwtVerifier};
 use crate::connection::limiter::ConnectionLimiter;
@@ -26,6 +26,9 @@ const CHANNEL_CAPACITY: usize = 16;
 
 /// WebSocket close code sent when JWT authentication fails.
 const WS_CLOSE_AUTH_FAILED: u16 = 3000;
+
+/// WebSocket close code sent when the server is shutting down (RFC 6455 §7.4.1).
+const WS_CLOSE_GOING_AWAY: u16 = 1001;
 
 /// Shared application state passed to every Axum handler.
 #[derive(Clone)]
@@ -42,6 +45,8 @@ pub struct AppState {
     pub nats_consumer: Option<Arc<NatsConsumer>>,
     /// Prometheus metrics handle.
     pub metrics: Arc<Metrics>,
+    /// Shutdown broadcast: resolves to `true` when the server is draining.
+    pub shutdown_rx: watch::Receiver<bool>,
 }
 
 /// Query parameters extracted from the WebSocket upgrade URL.
@@ -183,7 +188,12 @@ async fn handle_socket(
 
     let (ws_sender, ws_receiver) = socket.split();
 
-    let outbound_handle = tokio::spawn(outbound_loop(rx, ws_sender, is_binary));
+    let outbound_handle = tokio::spawn(outbound_loop(
+        rx,
+        ws_sender,
+        is_binary,
+        state.shutdown_rx.clone(),
+    ));
 
     inbound_loop(
         ws_receiver,
@@ -193,6 +203,7 @@ async fn handle_socket(
         conn_id,
         &state,
         &allowed_streams,
+        state.shutdown_rx.clone(),
     )
     .await;
 
@@ -209,26 +220,61 @@ async fn outbound_loop(
     mut rx: mpsc::Receiver<Bytes>,
     mut sender: SplitSink<WebSocket, Message>,
     is_binary: bool,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    while let Some(payload) = rx.recv().await {
-        let msg = if is_binary {
-            Message::Binary(payload.to_vec())
-        } else {
-            match String::from_utf8(payload.to_vec()) {
-                Ok(text) => Message::Text(text),
-                Err(e) => {
-                    tracing::warn!("non-UTF-8 payload on JSON connection: {e}");
-                    continue;
+    loop {
+        tokio::select! {
+            payload = rx.recv() => {
+                match payload {
+                    Some(payload) => {
+                        if let Some(msg) = bytes_to_ws_msg(payload, is_binary) {
+                            if sender.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    None => break,
                 }
             }
-        };
-
-        if sender.send(msg).await.is_err() {
-            break;
+            _ = shutdown_rx.changed() => {
+                // Drain any queued outbound messages before closing.
+                while let Ok(payload) = rx.try_recv() {
+                    if let Some(msg) = bytes_to_ws_msg(payload, is_binary) {
+                        if sender.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                let _ = sender
+                    .send(Message::Close(Some(CloseFrame {
+                        code: WS_CLOSE_GOING_AWAY,
+                        reason: "server shutting down".into(),
+                    })))
+                    .await;
+                return;
+            }
         }
     }
 
     let _ = sender.close().await;
+}
+
+/// Converts a raw [`Bytes`] payload to a WebSocket [`Message`].
+///
+/// Returns `None` (and logs a warning) when a non-UTF-8 payload arrives on a
+/// JSON connection — the frame is silently dropped rather than closing the socket.
+fn bytes_to_ws_msg(payload: Bytes, is_binary: bool) -> Option<Message> {
+    if is_binary {
+        Some(Message::Binary(payload.to_vec()))
+    } else {
+        match String::from_utf8(payload.to_vec()) {
+            Ok(text) => Some(Message::Text(text)),
+            Err(e) => {
+                tracing::warn!("non-UTF-8 payload on JSON connection: {e}");
+                None
+            }
+        }
+    }
 }
 
 async fn inbound_loop(
@@ -239,6 +285,7 @@ async fn inbound_loop(
     conn_id: u64,
     state: &AppState,
     allowed_streams: &[String],
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut ping_interval = tokio::time::interval(Duration::from_secs(state.ping_interval_secs));
     ping_interval.tick().await;
@@ -281,6 +328,10 @@ async fn inbound_loop(
                         break;
                     }
                 }
+            }
+            _ = shutdown_rx.changed() => {
+                tracing::debug!(conn_id, "shutdown signal received");
+                break;
             }
         }
     }

@@ -216,6 +216,18 @@ impl NatsConsumer {
         Ok(messages)
     }
 
+    /// Flushes all pending outbound NATS data and waits for the server to acknowledge.
+    ///
+    /// Called during graceful shutdown to ensure all acks and publishes are delivered
+    /// before the process exits. Blocks until the flush completes or an error occurs.
+    pub async fn flush(&self) -> Result<(), GatewayError> {
+        self.client
+            .flush()
+            .await
+            .map_err(|e| GatewayError::JetStream(format!("flush: {e}")))?;
+        Ok(())
+    }
+
     /// Returns `true` if the underlying NATS client is still connected.
     #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {

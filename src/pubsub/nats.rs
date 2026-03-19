@@ -369,14 +369,10 @@ fn process_nats_message(
         .observe(t0.elapsed().as_secs_f64());
 
     if result.sent > 0 {
-        metrics
-            .messages_fanned_out
-            .inc_by(result.sent as u64);
+        metrics.messages_fanned_out.inc_by(result.sent as u64);
     }
     if result.dropped > 0 {
-        metrics
-            .messages_dropped
-            .inc_by(result.dropped as u64);
+        metrics.messages_dropped.inc_by(result.dropped as u64);
         tracing::debug!(
             stream = stream_name,
             seq = sequence,
@@ -396,9 +392,7 @@ async fn update_consumer_lag(
 ) {
     match consumer.info().await {
         Ok(info) => {
-            metrics
-                .nats_consumer_lag
-                .set(info.num_pending as i64);
+            metrics.nats_consumer_lag.set(info.num_pending as i64);
             tracing::debug!(
                 num_pending = info.num_pending,
                 num_ack_pending = info.num_ack_pending,

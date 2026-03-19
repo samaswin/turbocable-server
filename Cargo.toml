@@ -19,7 +19,7 @@ jsonwebtoken      = "9"
 dashmap           = "5"
 bytes             = "1"
 smallvec          = { version = "1", features = ["union"] }
-prometheus        = { version = "0.13", features = ["process"] }
+prometheus        = { version = "0.13", features = ["process"], default-features = false }
 tracing           = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap              = { version = "4", features = ["derive", "env"] }
@@ -28,9 +28,9 @@ uuid              = { version = "1", features = ["v4", "fast-rng"] }
 num_cpus          = "1"
 socket2           = { version = "0.5", features = ["all"] }
 rlimit            = "0.10"
-time              = ">=0.3.0, <0.3.37"
-time-core         = ">=0.1.0, <0.1.3"
-time-macros       = ">=0.2.0, <0.2.19"
+time              = ">=0.3.47"
+time-core         = ">=0.1.0"
+time-macros       = ">=0.2.19"
 
 [dependencies.futures]
 version = "0.3"

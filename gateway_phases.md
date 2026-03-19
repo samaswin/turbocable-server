@@ -471,7 +471,7 @@ nats pub TURBOCABLE.chat_room_1 '{"message":"hello"}'
 
 ---
 
-## Phase 7 — Prometheus Metrics + /metrics Endpoint
+## Phase 7 — Prometheus Metrics + /metrics Endpoint - Completed
 **Goal:** All key metrics instrumented. Grafana dashboard template ready.
 **Duration:** 1–2 days
 **Done when:** `curl localhost:9292/metrics` returns valid Prometheus text format.

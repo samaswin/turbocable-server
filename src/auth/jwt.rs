@@ -44,10 +44,7 @@ impl JwtVerifier {
 
     /// Returns the current RSA public key in PEM format.
     pub fn current_pem(&self) -> Vec<u8> {
-        self.pem
-            .read()
-            .map(|g| g.to_vec())
-            .unwrap_or_default()
+        self.pem.read().map(|g| g.to_vec()).unwrap_or_default()
     }
 
     /// Decodes and validates a JWT token, returning the claims on success.

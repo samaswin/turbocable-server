@@ -97,7 +97,10 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
 /// Returns all gateway metrics in Prometheus text exposition format.
 async fn metrics_handler() -> impl IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         Metrics::render(),
     )
 }

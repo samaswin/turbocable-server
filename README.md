@@ -231,6 +231,26 @@ docker run -p 9292:9292 -e TURBOCABLE_NATS_URL=nats://host.docker.internal:4222 
 
 The release image is built `FROM scratch` and is approximately 12 MB.
 
+## Load Testing
+
+See [`bench/README.md`](bench/README.md) for the complete Phase 10 load testing guide.
+
+**Quick start:**
+
+```bash
+# 1. Apply OS tuning (once per machine)
+sudo bash bench/scripts/tune_os.sh
+
+# 2. Build the message publisher
+cargo build --release --bin tc-publish
+
+# 3. Run single-node baseline (333k connections, p99 < 30 ms)
+TARGET=333000 GATEWAY_WSS_URL=ws://localhost:9292/cable bash bench/scripts/run_single_node.sh
+
+# 4. In-process Criterion registry benchmarks (no NATS needed)
+cargo bench --bench registry_bench
+```
+
 ## Development
 
 ```bash

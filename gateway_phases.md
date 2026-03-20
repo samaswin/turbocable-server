@@ -559,6 +559,10 @@ Heartbeat: gateway refreshes TTL every 25s for connected clients.
 ### 10.1 Single-Node Baseline
 Target: 333k connections, p99 < 30ms, < 8 KB/connection
 ```bash
+# Quick helper (also starts tc-publish and memory profiler)
+TARGET=333000 GATEWAY_WSS_URL=ws://node1:9292/cable bash bench/scripts/run_single_node.sh
+
+# Or run k6 directly
 k6 run bench/k6/load_1m.js \
   -e TARGET=333000 \
   -e GATEWAY_WSS_URL=ws://node1:9292/cable
@@ -568,11 +572,19 @@ k6 run bench/k6/load_1m.js \
 Target: 1M connections, p99 < 50ms, zero message loss
 ```bash
 # Run 10 k6 agents simultaneously, each targeting 100k connections
+# On agent 1 (publisher):
+IS_PUBLISHER=true TARGET=100000 GATEWAY_WSS_URL=wss://lb.example.com/cable bash bench/scripts/run_cluster.sh
+
+# On agents 2-10:
 k6 run bench/k6/load_1m.js -e TARGET=100000 -e GATEWAY_WSS_URL=wss://lb.example.com/cable
 ```
 
 ### 10.3 Memory Profile
 ```bash
+# Automated (scrapes /metrics for connection count)
+bash bench/scripts/memory_profile.sh
+
+# Manual one-liner
 PID=$(pgrep turbocable-server)
 while true; do
   RSS=$(awk '/VmRSS/{print $2}' /proc/$PID/status)
@@ -582,16 +594,38 @@ while true; do
 done
 ```
 
-### 10.4 Performance Tuning Checklist
+### 10.3b Criterion Micro-Benchmarks (in-process, no NATS required)
+```bash
+# Fanout throughput at 1k / 10k / 100k connections
+cargo bench --bench registry_bench
+# HTML report: target/criterion/report/index.html
+```
+
+### 10.4 Fan-Out Message Publisher
+The `tc-publish` binary sends messages with sequence numbers and timestamps so
+k6 clients can measure end-to-end latency and verify zero message loss.
+```bash
+# Build
+cargo build --release --bin tc-publish
+
+# 10 msg/s for 10 minutes to the "bench" stream
+./target/release/tc-publish --stream bench --rate 10 --duration 600
+```
+
+### 10.5 Performance Tuning Checklist
 If you miss targets, check in this order:
 - [ ] `jemallocator` is linked (verify with `nm binary | grep jemalloc`)
 - [ ] `LimitNOFILE=2000000` in systemd unit
-- [ ] `net.core.somaxconn=65535` applied
+- [ ] `net.core.somaxconn=65535` applied (`sudo bash bench/scripts/tune_os.sh`)
 - [ ] Channel capacity ≤ 16 (reduce if memory over budget)
 - [ ] `DashMap` shard count — try 128 if you see lock contention in flamegraphs
 - [ ] NATS `max_ack_pending` set appropriately
 
-### 10.5 Phase 10 Checklist
+### 10.6 Phase 10 Checklist
+- [x] Load test infrastructure in place (`bench/k6/load_1m.js`, `bench/scripts/`)
+- [x] `tc-publish` binary for fan-out latency measurement (`src/bin/publish.rs`)
+- [x] Criterion registry benchmarks (`benches/registry_bench.rs`)
+- [x] OS tuning script (`bench/scripts/tune_os.sh`)
 - [ ] 333k connections sustained (1 node, 10 min)
 - [ ] 1M connections sustained (3 nodes, 10 min)
 - [ ] Fan-out p99 < 50ms at 1M

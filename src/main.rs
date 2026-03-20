@@ -1,24 +1,13 @@
 //! turbocable-server — high-performance WebSocket gateway for TurboCable.
 //!
-//! Handles 1M+ concurrent WebSocket connections with sub-50ms fan-out latency.
-//! Uses NATS JetStream for message delivery and RS256 JWT for authentication.
-
-#![warn(missing_docs)]
+//! Entry point: raises file-descriptor limits, initialises logging, and starts
+//! the Axum/NATS gateway server.
 
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
-mod auth;
-mod config;
-mod connection;
-mod errors;
-mod metrics;
-mod presence;
-mod protocol;
-mod pubsub;
-mod server;
-
 use clap::Parser;
+use turbocable_server::{config::Config, server};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -30,7 +19,7 @@ async fn main() {
         .json()
         .init();
 
-    let cfg = config::Config::parse();
+    let cfg = Config::parse();
     raise_fd_limit(2_000_000);
 
     tracing::info!(port = cfg.port, node_id = %cfg.node_id, "starting");

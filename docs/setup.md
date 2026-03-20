@@ -419,10 +419,10 @@ Pre-built multi-platform images (linux/amd64 and linux/arm64) are published to
 the GitHub Container Registry on every release:
 
 ```bash
-docker pull ghcr.io/turbocable/gateway:latest
+docker pull ghcr.io/turbocable/server:latest
 docker run -p 9292:9292 \
   -e TURBOCABLE_NATS_URL=nats://host.docker.internal:4222 \
-  ghcr.io/turbocable/gateway:latest
+  ghcr.io/turbocable/server:latest
 ```
 
 Build locally from source (produces a fully static ~12 MB image):

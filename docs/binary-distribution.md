@@ -51,13 +51,13 @@ GitHub Container Registry on every release:
 
 ```bash
 # Pull for the current host platform
-docker pull ghcr.io/turbocable/gateway:latest
+docker pull ghcr.io/turbocable/server:latest
 
 # Pull a specific version
-docker pull ghcr.io/turbocable/gateway:0.4.0
+docker pull ghcr.io/turbocable/server:0.4.0
 
 # Explicitly target ARM64 (e.g. from an x86_64 host)
-docker pull --platform linux/arm64 ghcr.io/turbocable/gateway:latest
+docker pull --platform linux/arm64 ghcr.io/turbocable/server:latest
 ```
 
 ### Run
@@ -65,7 +65,7 @@ docker pull --platform linux/arm64 ghcr.io/turbocable/gateway:latest
 ```bash
 docker run -p 9292:9292 \
   -e TURBOCABLE_NATS_URL=nats://host.docker.internal:4222 \
-  ghcr.io/turbocable/gateway:latest
+  ghcr.io/turbocable/server:latest
 ```
 
 Pass any configuration via environment variables — see the
@@ -132,7 +132,7 @@ build-linux          build-macos
 - Depends on `build-linux`
 - Downloads the pre-built amd64 and arm64 musl binaries
 - Builds a multi-platform Docker image using `docker buildx` + `Dockerfile.dist`
-- Pushes to `ghcr.io/turbocable/gateway` with `latest`, `MAJOR.MINOR`, and full
+- Pushes to `ghcr.io/turbocable/server` with `latest`, `MAJOR.MINOR`, and full
   version tags
 - Verifies the published image is under 20 MB
 

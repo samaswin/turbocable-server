@@ -229,14 +229,14 @@ Stream authorization uses glob patterns: `"*"` matches any stream,
 
 ```bash
 # Linux x86_64 (amd64)
-docker pull ghcr.io/turbocable/gateway:latest
+docker pull ghcr.io/turbocable/server:latest
 
 # Linux ARM64 (AWS Graviton, Apple M-series)
-docker pull --platform linux/arm64 ghcr.io/turbocable/gateway:latest
+docker pull --platform linux/arm64 ghcr.io/turbocable/server:latest
 
 docker run -p 9292:9292 \
   -e TURBOCABLE_NATS_URL=nats://host.docker.internal:4222 \
-  ghcr.io/turbocable/gateway:latest
+  ghcr.io/turbocable/server:latest
 ```
 
 The image is built `FROM scratch` with a fully static musl binary — approximately 12 MB, no shell or libc.
@@ -313,7 +313,7 @@ Every push and pull request to `main` runs the following checks in GitHub Action
 | **Documentation** | `cargo doc --no-deps` with `-D warnings` — ensures all public items are documented |
 | **Security Audit** | `cargo audit` — checks dependencies for known vulnerabilities |
 | **MSRV** | `cargo check` with Rust 1.88 — verifies minimum supported Rust version |
-| **Release** | Cross-compiles all 4 platform binaries, builds multi-platform Docker image, publishes to `ghcr.io/turbocable/gateway` |
+| **Release** | Cross-compiles all 4 platform binaries, builds multi-platform Docker image, publishes to `ghcr.io/turbocable/server` |
 
 ### Coding Standards
 

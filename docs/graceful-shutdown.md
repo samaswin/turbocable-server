@@ -227,7 +227,7 @@ spec:
 
       containers:
         - name: gateway
-          image: turbocable/gateway:latest
+          image: turbocable/server:latest
           lifecycle:
             preStop:
               exec:

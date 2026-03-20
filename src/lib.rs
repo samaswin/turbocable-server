@@ -6,7 +6,6 @@
 //! This crate is usable as a library to allow external tools (e.g. Criterion benchmarks)
 //! to access the connection registry directly without going through the binary entry point.
 
-#![allow(missing_docs)]
 
 pub(crate) mod auth;
 pub mod config;

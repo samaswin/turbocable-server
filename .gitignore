@@ -20,3 +20,6 @@
 Thumbs.db
 private.pem
 public.pem
+
+# Agents
+.claude

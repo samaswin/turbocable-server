@@ -73,6 +73,16 @@ wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo update 2>&1"
 
 If `cargo update` does not resolve the vulnerability (e.g. it requires a major version bump), manually update the dependency version in `Cargo.toml` and run `cargo update` again. Re-run `cargo audit` to confirm all vulnerabilities are resolved before considering the task done.
 
+## Documentation and README Updates
+
+After completing any task, **always check and update documentation** if the task introduced new features, changed behavior, or affected any documented area:
+
+1. Review `README.md` — update setup steps, feature lists, configuration examples, or usage instructions if affected.
+2. Review any `.md` files in the project root (e.g. `gateway_phases.md`, `AGENTS.md`) — update if the task changes architecture, phases, or agent behavior.
+3. If a new feature or component was added, ensure it is reflected in the relevant docs.
+
+Do **not** skip this step. Documentation should always stay in sync with the code.
+
 ## Installation Requirements
 
 If a task requires installing new tools, packages, or dependencies (e.g. `cargo install`, `apt install`, system tools), the agent **must not attempt the installation itself**. Instead:

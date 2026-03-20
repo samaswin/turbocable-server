@@ -528,7 +528,7 @@ Used by Rails to verify it and the gateway are in sync during debugging.
 
 ---
 
-## Phase 9 — Presence (NATS KV)
+## Phase 9 — Presence (NATS KV) - Completed
 **Goal:** Gateway reads/writes presence via NATS KV bucket `TC_PRESENCE`.
 **Duration:** 1–2 days
 **Done when:** Subscribe to a stream → presence entry appears in KV. Disconnect → expires in 30s.

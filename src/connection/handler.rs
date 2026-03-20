@@ -70,6 +70,16 @@ struct HelloMessage {
     last_seq: Option<String>,
 }
 
+/// Per-connection context bundling the fields that are fixed for the lifetime of one connection.
+struct ConnContext<'a> {
+    conn_id: u64,
+    codec: &'a dyn Codec,
+    is_binary: bool,
+    tx: &'a mpsc::Sender<Bytes>,
+    allowed_streams: &'a [String],
+    user_id: Option<&'a str>,
+}
+
 /// Axum handler that negotiates the WebSocket sub-protocol and upgrades the connection.
 pub async fn ws_upgrade(
     ws: WebSocketUpgrade,
@@ -199,18 +209,15 @@ async fn handle_socket(
         state.shutdown_rx.clone(),
     ));
 
-    inbound_loop(
-        ws_receiver,
-        &tx,
-        &*codec,
-        is_binary,
+    let ctx = ConnContext {
         conn_id,
-        &state,
-        &allowed_streams,
-        user_id.as_deref(),
-        state.shutdown_rx.clone(),
-    )
-    .await;
+        codec: &*codec,
+        is_binary,
+        tx: &tx,
+        allowed_streams: &allowed_streams,
+        user_id: user_id.as_deref(),
+    };
+    inbound_loop(ws_receiver, ctx, &state, state.shutdown_rx.clone()).await;
 
     state.registry.deregister(conn_id);
     state.metrics.connections_active.dec();
@@ -284,13 +291,8 @@ fn bytes_to_ws_msg(payload: Bytes, is_binary: bool) -> Option<Message> {
 
 async fn inbound_loop(
     mut receiver: SplitStream<WebSocket>,
-    tx: &mpsc::Sender<Bytes>,
-    codec: &dyn Codec,
-    is_binary: bool,
-    conn_id: u64,
+    ctx: ConnContext<'_>,
     state: &AppState,
-    allowed_streams: &[String],
-    user_id: Option<&str>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut ping_interval = tokio::time::interval(Duration::from_secs(state.ping_interval_secs));
@@ -311,22 +313,18 @@ async fn inbound_loop(
                 match msg {
                     Some(Ok(Message::Text(ref text))) => {
                         handle_client_frame(
-                            text.as_bytes(), codec, is_binary, conn_id,
-                            tx, state, allowed_streams, user_id, &mut last_seq,
-                            &mut heartbeats,
+                            text.as_bytes(), &ctx, state, &mut last_seq, &mut heartbeats,
                         ).await;
                     }
                     Some(Ok(Message::Binary(ref data))) => {
                         handle_client_frame(
-                            data, codec, is_binary, conn_id,
-                            tx, state, allowed_streams, user_id, &mut last_seq,
-                            &mut heartbeats,
+                            data, &ctx, state, &mut last_seq, &mut heartbeats,
                         ).await;
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(e)) => {
-                        tracing::debug!(conn_id, error = %e, "ws receive error");
+                        tracing::debug!(ctx.conn_id, error = %e, "ws receive error");
                         break;
                     }
                 }
@@ -336,21 +334,21 @@ async fn inbound_loop(
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
-                if let Ok(ping) = codec.encode(&ServerMessage::Ping { message: ts }) {
-                    if tx.send(ping).await.is_err() {
+                if let Ok(ping) = ctx.codec.encode(&ServerMessage::Ping { message: ts }) {
+                    if ctx.tx.send(ping).await.is_err() {
                         break;
                     }
                 }
             }
             _ = shutdown_rx.changed() => {
-                tracing::debug!(conn_id, "shutdown signal received");
+                tracing::debug!(ctx.conn_id, "shutdown signal received");
                 break;
             }
         }
     }
 
     // Clean up presence for all remaining subscriptions on disconnect.
-    if let (Some(uid), Some(presence)) = (user_id, state.presence.as_ref()) {
+    if let (Some(uid), Some(presence)) = (ctx.user_id, state.presence.as_ref()) {
         for stream in heartbeats.keys() {
             presence.delete(stream, uid).await;
         }
@@ -360,44 +358,39 @@ async fn inbound_loop(
 
 async fn handle_client_frame(
     data: &[u8],
-    codec: &dyn Codec,
-    is_binary: bool,
-    conn_id: u64,
-    tx: &mpsc::Sender<Bytes>,
+    ctx: &ConnContext<'_>,
     state: &AppState,
-    allowed_streams: &[String],
-    user_id: Option<&str>,
     last_seq: &mut Option<u64>,
     heartbeats: &mut std::collections::HashMap<String, HeartbeatHandle>,
 ) {
-    match codec.decode(data) {
+    match ctx.codec.decode(data) {
         Ok(cmd) => {
-            tracing::debug!(conn_id, ?cmd, "received command");
+            tracing::debug!(ctx.conn_id, ?cmd, "received command");
             match cmd {
                 ClientCommand::Subscribe { identifier } => {
-                    if !jwt::is_allowed(allowed_streams, &identifier) {
+                    if !jwt::is_allowed(ctx.allowed_streams, &identifier) {
                         tracing::warn!(
-                            conn_id,
+                            ctx.conn_id,
                             identifier,
                             "subscribe rejected: stream not allowed"
                         );
                         if let Ok(reject) =
-                            codec.encode(&ServerMessage::RejectSubscription { identifier })
+                            ctx.codec.encode(&ServerMessage::RejectSubscription { identifier })
                         {
-                            let _ = tx.send(reject).await;
+                            let _ = ctx.tx.send(reject).await;
                         }
                         return;
                     }
 
-                    state.registry.subscribe(conn_id, &identifier);
+                    state.registry.subscribe(ctx.conn_id, &identifier);
 
                     // Write presence entry and start heartbeat (if presence is configured).
-                    if let (Some(uid), Some(presence)) = (user_id, state.presence.as_ref()) {
+                    if let (Some(uid), Some(presence)) = (ctx.user_id, state.presence.as_ref()) {
                         presence.put(&identifier, uid).await;
                         let handle = presence.start_heartbeat(identifier.clone(), uid.to_string());
                         heartbeats.insert(identifier.clone(), handle);
                         tracing::debug!(
-                            conn_id,
+                            ctx.conn_id,
                             stream = identifier,
                             user_id = uid,
                             "presence written"
@@ -407,24 +400,25 @@ async fn handle_client_frame(
                     // Replay missed messages when client reconnected with last_seq.
                     // Happens before confirm so the client receives replayed messages first.
                     if let Some(seq) = *last_seq {
-                        replay_for_stream(&identifier, seq, conn_id, codec, tx, state).await;
+                        replay_for_stream(&identifier, seq, ctx.conn_id, ctx.codec, ctx.tx, state)
+                            .await;
                     }
 
                     if let Ok(confirm) =
-                        codec.encode(&ServerMessage::ConfirmSubscription { identifier })
+                        ctx.codec.encode(&ServerMessage::ConfirmSubscription { identifier })
                     {
-                        let _ = tx.send(confirm).await;
+                        let _ = ctx.tx.send(confirm).await;
                     }
                 }
                 ClientCommand::Unsubscribe { identifier } => {
-                    state.registry.unsubscribe(conn_id, &identifier);
+                    state.registry.unsubscribe(ctx.conn_id, &identifier);
 
                     // Remove heartbeat (aborts task) and delete presence key.
-                    if let (Some(uid), Some(presence)) = (user_id, state.presence.as_ref()) {
+                    if let (Some(uid), Some(presence)) = (ctx.user_id, state.presence.as_ref()) {
                         heartbeats.remove(&identifier); // Drop aborts heartbeat task.
                         presence.delete(&identifier, uid).await;
                         tracing::debug!(
-                            conn_id,
+                            ctx.conn_id,
                             stream = identifier,
                             user_id = uid,
                             "presence removed"
@@ -439,7 +433,7 @@ async fn handle_client_frame(
                         let payload = Bytes::copy_from_slice(data.as_bytes());
                         if let Err(e) = nats.publish(&identifier, payload).await {
                             tracing::warn!(
-                                conn_id,
+                                ctx.conn_id,
                                 identifier,
                                 error = %e,
                                 "failed to publish client message to NATS"
@@ -447,7 +441,7 @@ async fn handle_client_frame(
                         }
                     } else {
                         tracing::debug!(
-                            conn_id,
+                            ctx.conn_id,
                             identifier,
                             "client message dropped (NATS not available)"
                         );
@@ -457,10 +451,10 @@ async fn handle_client_frame(
         }
         Err(_) => {
             // Not a standard command — try parsing as a "hello" reconnection message.
-            if try_parse_hello(data, is_binary, conn_id, last_seq) {
+            if try_parse_hello(data, ctx.is_binary, ctx.conn_id, last_seq) {
                 return;
             }
-            tracing::warn!(conn_id, "failed to decode client frame");
+            tracing::warn!(ctx.conn_id, "failed to decode client frame");
         }
     }
 }

@@ -7,7 +7,7 @@
 //! long-lived connections are not incorrectly evicted.
 //!
 //! ## Key Layout
-//! ```
+//! ```text
 //! Bucket : TC_PRESENCE
 //! Key    : {stream_name}.{user_id}
 //! Value  : b"1"   (presence marker, content is not meaningful)
@@ -152,6 +152,6 @@ mod tests {
 
     #[test]
     fn heartbeat_interval_less_than_ttl() {
-        assert!(HEARTBEAT_INTERVAL_SECS < PRESENCE_TTL_SECS);
+        const _: () = assert!(HEARTBEAT_INTERVAL_SECS < PRESENCE_TTL_SECS);
     }
 }

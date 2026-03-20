@@ -374,8 +374,9 @@ async fn handle_client_frame(
                             identifier,
                             "subscribe rejected: stream not allowed"
                         );
-                        if let Ok(reject) =
-                            ctx.codec.encode(&ServerMessage::RejectSubscription { identifier })
+                        if let Ok(reject) = ctx
+                            .codec
+                            .encode(&ServerMessage::RejectSubscription { identifier })
                         {
                             let _ = ctx.tx.send(reject).await;
                         }
@@ -404,8 +405,9 @@ async fn handle_client_frame(
                             .await;
                     }
 
-                    if let Ok(confirm) =
-                        ctx.codec.encode(&ServerMessage::ConfirmSubscription { identifier })
+                    if let Ok(confirm) = ctx
+                        .codec
+                        .encode(&ServerMessage::ConfirmSubscription { identifier })
                     {
                         let _ = ctx.tx.send(confirm).await;
                     }

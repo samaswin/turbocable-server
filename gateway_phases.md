@@ -551,7 +551,7 @@ Heartbeat: gateway refreshes TTL every 25s for connected clients.
 
 ---
 
-## Phase 10 — Load Testing
+## Phase 10 — Load Testing - Completed
 **Goal:** Validate 1M connections. Measure fan-out latency. Profile memory.
 **Duration:** 1 week (infrastructure setup + iteration)
 **Done when:** 3-node cluster sustains 1M connections for 10 minutes with p99 < 50ms.

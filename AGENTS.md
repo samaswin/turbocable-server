@@ -53,6 +53,14 @@ If the check fails, run `cargo fmt --all` to fix formatting, then re-verify:
 wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo fmt --all 2>&1"
 ```
 
+Also run `cargo clippy` to catch lint errors and warnings:
+
+```bash
+wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo clippy --all-targets --all-features -- -D warnings 2>&1"
+```
+
+If clippy reports errors, fix them before considering the task done.
+
 Also run `cargo doc` to ensure documentation builds without errors:
 
 ```bash

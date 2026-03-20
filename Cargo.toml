@@ -1,6 +1,6 @@
 [package]
 name        = "turbocable-server"
-version     = "0.3.0"
+version     = "0.4.0"
 edition     = "2021"
 description = "High-performance WebSocket gateway for TurboCable (1M+ connections)"
 license     = "MIT"
@@ -8,7 +8,6 @@ repository  = "https://github.com/samaswin/turbocable-server"
 rust-version = "1.88"
 
 [dependencies]
-jemallocator      = "0.5"
 tokio             = { version = "1",   features = ["full"] }
 axum              = { version = "0.7", features = ["ws"] }
 async-nats        = "0.35"
@@ -34,6 +33,10 @@ time-macros       = ">=0.2.19"
 
 [dependencies.futures]
 version = "0.3"
+
+# jemalloc is only used on glibc Linux; musl and macOS use the system allocator
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
+jemallocator = "0.5"
 
 [dev-dependencies]
 tokio-test = "0.4"

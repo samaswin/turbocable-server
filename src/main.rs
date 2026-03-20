@@ -3,6 +3,7 @@
 //! Entry point: raises file-descriptor limits, initialises logging, and starts
 //! the Axum/NATS gateway server.
 
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 

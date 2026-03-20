@@ -55,11 +55,11 @@ See [docs/architecture.md](docs/architecture.md) for the full system design.
 - **Graceful shutdown** — drains connections on SIGTERM with zero message loss
 - **Per-IP connection limiting** to prevent resource exhaustion
 - **SO_REUSEPORT + TCP_NODELAY** for optimal kernel-level performance
-- **jemalloc** allocator for predictable memory usage under high load
+- **jemalloc** allocator on glibc Linux for predictable memory usage under high load (musl and macOS use the system allocator)
 
 ## Requirements
 
-- Rust stable (1.78+)
+- Rust stable (1.88+)
 - NATS Server 2.10+ with JetStream enabled
 
 See [docs/setup.md](docs/setup.md) for detailed installation instructions.
@@ -80,7 +80,7 @@ RUST_LOG=info cargo run
 
 # Verify
 curl http://localhost:9292/health
-# => {"status":"ok","version":"0.1.0","connections":0}
+# => {"status":"ok","version":"0.4.0","connections":0}
 ```
 
 ### Test NATS fan-out
@@ -224,12 +224,42 @@ Stream authorization uses glob patterns: `"*"` matches any stream,
 
 ## Docker
 
+### Pre-built multi-platform image
+
 ```bash
+# Linux x86_64 (amd64)
+docker pull ghcr.io/turbocable/gateway:latest
+
+# Linux ARM64 (AWS Graviton, Apple M-series)
+docker pull --platform linux/arm64 ghcr.io/turbocable/gateway:latest
+
+docker run -p 9292:9292 \
+  -e TURBOCABLE_NATS_URL=nats://host.docker.internal:4222 \
+  ghcr.io/turbocable/gateway:latest
+```
+
+The image is built `FROM scratch` with a fully static musl binary — approximately 12 MB, no shell or libc.
+
+### Build locally from source
+
+```bash
+# x86_64 Linux (musl, static)
 docker build -t turbocable-server .
 docker run -p 9292:9292 -e TURBOCABLE_NATS_URL=nats://host.docker.internal:4222 turbocable-server
 ```
 
-The release image is built `FROM scratch` and is approximately 12 MB.
+## Pre-built Binaries
+
+Every release publishes static binaries for all four platforms:
+
+| Platform | Binary |
+|----------|--------|
+| Linux x86_64 (musl, static) | `turbocable-server-x86_64-linux` |
+| Linux ARM64 (musl, static) | `turbocable-server-aarch64-linux` |
+| macOS Apple Silicon | `turbocable-server-aarch64-macos` |
+| macOS Intel | `turbocable-server-x86_64-macos` |
+
+Download from the [GitHub Releases](https://github.com/samaswin/turbocable-server/releases) page. Linux binaries are fully static — no glibc dependency, runs on any Linux distribution.
 
 ## Load Testing
 
@@ -281,21 +311,22 @@ Every push and pull request to `main` runs the following checks in GitHub Action
 | **Tests** | `cargo test --all-features` — runs all unit and integration tests |
 | **Documentation** | `cargo doc --no-deps` with `-D warnings` — ensures all public items are documented |
 | **Security Audit** | `cargo audit` — checks dependencies for known vulnerabilities |
-| **MSRV** | `cargo check` with Rust 1.78 — verifies minimum supported Rust version |
+| **MSRV** | `cargo check` with Rust 1.88 — verifies minimum supported Rust version |
+| **Release** | Cross-compiles all 4 platform binaries, builds multi-platform Docker image, publishes to `ghcr.io/turbocable/gateway` |
 
 ### Coding Standards
 
 - **`#![warn(missing_docs)]`** is enabled — all public types and functions must have doc comments
 - **`rustflags = ["-D", "warnings"]`** in `.cargo/config.toml` — compiler warnings are errors
 - **`rustfmt.toml`** enforces consistent formatting (100-char lines, 4-space indent)
-- **`clippy.toml`** tunes clippy lints for the project (MSRV 1.78)
+- **`clippy.toml`** tunes clippy lints for the project (MSRV 1.78 — note: `Cargo.toml` MSRV is 1.88)
 - **`.editorconfig`** ensures consistent whitespace across editors
 
 ## Project Structure
 
 ```
 src/
-├── main.rs                 # jemalloc, Tokio runtime, startup
+├── main.rs                 # jemalloc (glibc Linux), Tokio runtime, startup
 ├── config.rs               # CLI/env configuration
 ├── server.rs               # Axum router, SO_REUSEPORT listener, NATS init
 ├── errors.rs               # Typed error hierarchy
@@ -323,6 +354,7 @@ src/
 | [docs/setup.md](docs/setup.md) | Prerequisites, installation, configuration reference |
 | [docs/jwt-authentication.md](docs/jwt-authentication.md) | JWT auth, stream authorization, manual testing guide |
 | [docs/nats-jetstream.md](docs/nats-jetstream.md) | NATS JetStream fan-out pipeline, replay, and manual testing |
+| [docs/binary-distribution.md](docs/binary-distribution.md) | Cross-compilation targets, Docker image, release pipeline |
 
 ## Related Packages
 

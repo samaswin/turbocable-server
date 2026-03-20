@@ -229,7 +229,6 @@ impl NatsConsumer {
     }
 
     /// Returns `true` if the underlying NATS client is still connected.
-    #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
         self.client.connection_state() == async_nats::connection::State::Connected
     }

@@ -105,7 +105,7 @@ This is primarily a memory and concurrency problem:
 | **Concurrency model** | Tokio async runtime — millions of tasks on 16 cores |
 | **Zero-copy fan-out** | `bytes::Bytes::clone()` = 1 atomic increment, no heap allocation |
 | **Lock-free registry** | `DashMap` with 64 shards — most operations touch only 1 shard |
-| **Allocator** | jemalloc — 15–20% throughput improvement over system allocator under sustained load |
+| **Allocator** | jemalloc on glibc Linux — 15–20% throughput improvement over system allocator under sustained load (musl/macOS use the system allocator) |
 | **No GC pauses** | Deterministic memory management — no stop-the-world pauses during fan-out |
 
 ### Memory budget at 1M connections
@@ -129,29 +129,26 @@ reaches 1M.
 
 ```
 src/
-├── main.rs                 # jemalloc, Tokio runtime, startup
+├── main.rs                 # jemalloc (glibc Linux), Tokio runtime, startup
+├── lib.rs                  # crate root — re-exports public modules
 ├── config.rs               # clap Config, env vars
 ├── server.rs               # Axum router, SO_REUSEPORT listener, NATS init
 ├── errors.rs               # Typed error hierarchy
+├── metrics.rs              # Prometheus gauges, counters, histograms, /metrics handler
 ├── auth/
-│   ├── mod.rs
 │   ├── jwt.rs              # RS256 verification, stream glob matching
 │   └── key_watcher.rs      # NATS KV watcher, file fallback, hot-reload
 ├── connection/
-│   ├── mod.rs
 │   ├── handler.rs          # WS upgrade, per-connection lifecycle
 │   ├── registry.rs         # DashMap registry — the core data structure
 │   └── limiter.rs          # Per-IP connection limits
+├── presence/               # NATS KV-backed presence tracking (TTL-based)
 ├── protocol/
-│   ├── mod.rs              # Codec trait, sub-protocol negotiation
 │   ├── types.rs            # ClientCommand / ServerMessage enums
 │   ├── json.rs             # ActionCable-compatible JSON codec
 │   └── msgpack.rs          # Binary codec (rmp-serde)
-├── pubsub/
-│   ├── mod.rs              # NATS JetStream module docs
-│   └── nats.rs             # NatsConsumer: fanout, publish, replay
-└── metrics/
-    └── mod.rs              # Prometheus gauges, counters, histograms
+└── pubsub/
+    └── nats.rs             # NatsConsumer: fanout, publish, replay
 ```
 
 ### Connection lifecycle

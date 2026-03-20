@@ -2,7 +2,6 @@
 
 /// All errors that can occur during gateway operation.
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum GatewayError {
     /// Authentication or authorization failure.
     #[error("auth failed: {0}")]

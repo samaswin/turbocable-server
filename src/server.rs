@@ -158,12 +158,18 @@ fn create_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
     tokio::net::TcpListener::from_std(socket.into())
 }
 
-/// Returns a JSON health-check response with the current connection count.
+/// Returns a JSON health-check response with the current connection count and NATS status.
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let nats_connected = state
+        .nats_consumer
+        .as_ref()
+        .map(|c| c.is_connected())
+        .unwrap_or(false);
     Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "connections": state.registry.connection_count(),
+        "nats_connected": nats_connected,
     }))
 }
 

@@ -110,7 +110,7 @@ impl Registry {
     /// Sends the same `payload` to every subscriber regardless of codec type.
     /// Use [`fanout_encoded`](Self::fanout_encoded) when different encodings
     /// are needed for JSON vs MessagePack connections (NATS consumer path).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn fanout(&self, stream: &str, payload: Bytes) -> FanoutResult {
         self.fanout_encoded(stream, payload.clone(), payload)
     }

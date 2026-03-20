@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1.4
+#
+# Packages pre-built static binaries into a scratch image.
+# Used by the release CI workflow after cross-compiling for each platform.
+#
+# Expected build context layout:
+#   linux/amd64/turbocable-server   (x86_64-unknown-linux-musl binary)
+#   linux/arm64/turbocable-server   (aarch64-unknown-linux-musl binary)
+#
+# Build with:
+#   docker buildx build \
+#     --platform linux/amd64,linux/arm64 \
+#     -f Dockerfile.dist \
+#     -t ghcr.io/turbocable/gateway:latest \
+#     --push \
+#     dist/
+
+FROM scratch
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+COPY ${TARGETOS}/${TARGETARCH}/turbocable-server /gateway
+
+EXPOSE 9292
+ENTRYPOINT ["/gateway"]

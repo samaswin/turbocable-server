@@ -23,7 +23,7 @@ locally.
 ## System Requirements
 
 - **OS**: macOS (Apple Silicon or Intel) or Linux (x86_64 / ARM64)
-- **Rust**: stable 1.78+
+- **Rust**: stable 1.88+
 - **NATS Server**: 2.10+ with JetStream enabled
 - **asdf**: version manager (recommended for Rust toolchain)
 
@@ -42,7 +42,7 @@ asdf plugin add rust
 asdf install
 
 # Verify
-rustc --version   # should show stable 1.78+
+rustc --version   # should show stable 1.88+
 cargo --version
 ```
 
@@ -167,8 +167,8 @@ cargo build
 cargo build --release
 ```
 
-The first build downloads and compiles all dependencies (including jemalloc)
-and may take a few minutes.
+The first build downloads and compiles all dependencies and may take a few minutes.
+On glibc Linux, jemalloc is also compiled; on musl Linux and macOS the system allocator is used.
 
 ---
 
@@ -330,7 +330,7 @@ Expected:
 ```json
 {
   "status": "ok",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "connections": 0
 }
 ```
@@ -413,9 +413,32 @@ See [NATS JetStream Integration](nats-jetstream.md) for full details.
 
 ---
 
+## Running via Docker
+
+Pre-built multi-platform images (linux/amd64 and linux/arm64) are published to
+the GitHub Container Registry on every release:
+
+```bash
+docker pull ghcr.io/turbocable/gateway:latest
+docker run -p 9292:9292 \
+  -e TURBOCABLE_NATS_URL=nats://host.docker.internal:4222 \
+  ghcr.io/turbocable/gateway:latest
+```
+
+Build locally from source (produces a fully static ~12 MB image):
+
+```bash
+docker build -t turbocable-server .
+```
+
+See [binary-distribution.md](binary-distribution.md) for the full release pipeline and cross-compilation details.
+
+---
+
 ## Related Documentation
 
 - [Architecture Overview](architecture.md) — system design, data flow, and capacity planning
 - [JWT Authentication](jwt-authentication.md) — token format, key rotation, and auth testing
 - [NATS JetStream Integration](nats-jetstream.md) — fan-out pipeline, replay, and NATS configuration
 - [Graceful Shutdown](graceful-shutdown.md) — SIGTERM handling, drain testing, Kubernetes configuration
+- [Binary Distribution](binary-distribution.md) — cross-compilation targets, Docker image, release pipeline

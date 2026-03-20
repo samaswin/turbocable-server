@@ -68,7 +68,7 @@ cargo run -- --jwt-public-key-path /path/to/public_key.pem
 
 If `TURBOCABLE_JWT_PUBLIC_KEY_PATH` is **not** set, turbocable-server will
 attempt to load the key from the NATS KV bucket `TC_PUBKEYS`, key
-`rails_public_key`.
+`rails_public_key` (the key name used by the turbocable publisher gem).
 
 A background watcher is spawned to pick up key rotations automatically —
 new connections will use the updated key within seconds.
@@ -146,7 +146,7 @@ matches.
 ## Key Hot-Reload (NATS KV)
 
 turbocable-server watches the NATS KV bucket `TC_PUBKEYS` for changes to the
-`rails_public_key` entry. When a new key is published:
+`rails_public_key` entry (the key name used by the turbocable publisher gem). When a new key is published:
 
 1. The background watcher detects the change.
 2. The internal `DecodingKey` is atomically swapped (behind a `RwLock`).
@@ -155,7 +155,7 @@ turbocable-server watches the NATS KV bucket `TC_PUBKEYS` for changes to the
 
 This enables zero-downtime key rotation.
 
-### Publishing a new key from Rails (or CLI)
+### Publishing a new key
 
 ```bash
 # Using the nats CLI
@@ -182,7 +182,7 @@ nats kv put TC_PUBKEYS rails_public_key "$(cat /path/to/new_public_key.pem)"
 
 - `openssl` (for key generation)
 - `wscat` (`npm install -g wscat`)
-- `ruby` with the `jwt` gem (`gem install jwt`)
+- `python3` with PyJWT (`pip install pyjwt cryptography`)
 
 ### Step 1: Generate an RSA key pair
 
@@ -203,41 +203,39 @@ Verify the log shows: `JWT auth enabled (key loaded from file)`.
 
 ### Step 3: Generate test JWTs
 
-Create `/tmp/gen_jwt.rb`:
+Create `/tmp/gen_jwt.py`:
 
-```ruby
-require "jwt"
+```python
+import jwt, time, sys
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
-private_key = OpenSSL::PKey::RSA.new(File.read("/tmp/tc_private.pem"))
-
-mode = ARGV[0] || "valid"
+private_key = load_pem_private_key(open("/tmp/tc_private.pem", "rb").read(), password=None)
+mode = sys.argv[1] if len(sys.argv) > 1 else "valid"
 
 claims = {
-  "sub"             => "user_42",
-  "allowed_streams" => ["chat_room_*", "notifications"],
-  "iat"             => Time.now.to_i,
-  "exp"             => Time.now.to_i + 3600
+    "sub": "user_42",
+    "allowed_streams": ["chat_room_*", "notifications"],
+    "iat": int(time.time()),
+    "exp": int(time.time()) + 3600,
 }
 
-case mode
-when "expired"
-  claims["exp"] = Time.now.to_i - 60
-when "wildcard"
-  claims["allowed_streams"] = ["*"]
-when "restricted"
-  claims["allowed_streams"] = ["admin_only"]
-end
+if mode == "expired":
+    claims["exp"] = int(time.time()) - 60
+elif mode == "wildcard":
+    claims["allowed_streams"] = ["*"]
+elif mode == "restricted":
+    claims["allowed_streams"] = ["admin_only"]
 
-puts JWT.encode(claims, private_key, "RS256")
+print(jwt.encode(claims, private_key, algorithm="RS256"))
 ```
 
 Generate tokens:
 
 ```bash
-VALID_TOKEN=$(ruby /tmp/gen_jwt.rb valid)
-EXPIRED_TOKEN=$(ruby /tmp/gen_jwt.rb expired)
-WILDCARD_TOKEN=$(ruby /tmp/gen_jwt.rb wildcard)
-RESTRICTED_TOKEN=$(ruby /tmp/gen_jwt.rb restricted)
+VALID_TOKEN=$(python3 /tmp/gen_jwt.py valid)
+EXPIRED_TOKEN=$(python3 /tmp/gen_jwt.py expired)
+WILDCARD_TOKEN=$(python3 /tmp/gen_jwt.py wildcard)
+RESTRICTED_TOKEN=$(python3 /tmp/gen_jwt.py restricted)
 ```
 
 ### Step 4: Run the test scenarios
@@ -384,7 +382,7 @@ not the private key.
 ### "NATS KV key watcher not available"
 
 The NATS KV bucket `TC_PUBKEYS` does not exist yet. This is expected during
-local development if Rails has not published the key. The file-based key is
+local development if the key has not been published yet. The file-based key is
 used as fallback.
 
 ### Connections rejected despite valid-looking token

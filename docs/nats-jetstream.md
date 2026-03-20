@@ -1,7 +1,7 @@
 # NATS JetStream Integration (Phase 6)
 
 This document covers the NATS JetStream integration in turbocable-server —
-the core message delivery pipeline that connects Rails broadcasts to
+the core message delivery pipeline that connects backend broadcasts to
 WebSocket clients.
 
 ---
@@ -9,15 +9,14 @@ WebSocket clients.
 ## Overview
 
 The gateway consumes messages from a NATS JetStream stream called
-`TURBOCABLE` and fans them out to WebSocket subscribers. This replaces the
-Redis pub/sub model used by ActionCable with persistent, replayable message
-delivery.
+`TURBOCABLE` and fans them out to WebSocket subscribers. This replaces
+traditional Redis pub/sub with persistent, replayable message delivery.
 
 ```
-Rails app                        NATS JetStream                   Gateway
+Backend app                      NATS JetStream                   Gateway
     │                                 │                              │
-    │ TurboCable.broadcast(           │                              │
-    │   "chat_room_42", data)         │                              │
+    │ publish(                        │                              │
+    │   TURBOCABLE.chat_room_42, data)│                              │
     │──publish TURBOCABLE.chat_room_42──>│                           │
     │                                 │──push to consumer gw_{node}──>│
     │                                 │                              │──fanout to subscribers
@@ -83,8 +82,8 @@ When a NATS message arrives:
    (e.g., `TURBOCABLE.chat_room_42` → `chat_room_42`)
 
 2. **Parse payload**: Try JSON first, fall back to MessagePack, then null.
-   This supports both the NATS CLI (`nats pub ... '{"data":"..."}') and the
-   Ruby gem (which MessagePack-encodes payloads)
+   This supports both the NATS CLI (`nats pub ... '{"data":"..."}') and
+   publisher libraries (which may MessagePack-encode payloads)
 
 3. **Build ServerMessage**: Wrap in `ServerMessage::Message` with the stream
    name as `identifier`, the parsed payload as `message`, and the JetStream
@@ -166,7 +165,7 @@ When a WebSocket client sends a `message` command:
 The gateway publishes the `data` payload to `TURBOCABLE.chat_room_42` via
 JetStream. This means client messages enter the same stream as
 server-initiated broadcasts and are delivered to all subscribers (including
-the sender, matching ActionCable behavior).
+the sender).
 
 ---
 
@@ -299,8 +298,7 @@ message command:
 ```
 
 Since the message is published to `TURBOCABLE.chat_room_1` via JetStream,
-you will receive it back (the sender also gets the broadcast, matching
-ActionCable behavior).
+you will receive it back (the sender also gets the broadcast).
 
 ### Test 4: Multiple streams
 

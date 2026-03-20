@@ -4,17 +4,18 @@ A high-performance, standalone WebSocket gateway written in Rust, designed to ha
 
 ## Why TurboCable?
 
-Rails ActionCable hits a ceiling at ~10k–50k connections per process. Every
-connection lives in Ruby, memory grows fast, and Redis pub/sub becomes the
-bottleneck. TurboCable solves this by moving **all WebSocket connections out of
-Ruby** into a dedicated Rust gateway:
+WebSocket servers hit a ceiling when connections grow. Most backend frameworks
+handle WebSockets in-process — each connection consumes a thread or coroutine,
+memory grows linearly, and the broadcast bus becomes the bottleneck. TurboCable
+solves this by moving **all WebSocket connections out of your backend** into a
+dedicated Rust gateway:
 
 ```
-ActionCable:  1 broadcast → Ruby iterates N connections → N Redis messages → slow
+Traditional:  1 broadcast → backend iterates N connections → N pub/sub messages → slow
 TurboCable:   1 broadcast → 1 NATS publish → Rust fans out to N connections → fast
 ```
 
-Rails does O(1) work per broadcast. The Rust gateway does O(N) fan-out using
+Your backend does O(1) work per broadcast. The Rust gateway does O(N) fan-out using
 zero-copy `Bytes` cloning and lock-free `DashMap` shards — completing a fan-out
 to 333k connections in under 10ms.
 
@@ -23,9 +24,9 @@ to 333k connections in under 10ms.
 ![TurboCable Architecture](docs/turbocable_architecture.svg)
 
 ```
-Rails App                    NATS JetStream                 turbocable-server
+Backend App                  NATS JetStream                 turbocable-server
 ┌─────────┐   publish        ┌─────────┐   push consumer   ┌──────────────┐
-│  .broadcast("room_42", d) ─┤ TURBOCABLE│──────────────────┤  Fan-out to  │
+│  publish("room_42", data) ─┤ TURBOCABLE│──────────────────┤  Fan-out to  │
 │         │                  │  stream   │                  │  1M clients  │
 └─────────┘                  └─────────┘                    └──────┬───────┘
                                                                     │
@@ -34,7 +35,7 @@ Rails App                    NATS JetStream                 turbocable-server
                                                              or turbocable-v1-msgpack)
 ```
 
-- **Rails** publishes once to NATS and moves on — it never touches WebSocket connections.
+- **Your backend** publishes once to NATS and moves on — it never touches WebSocket connections.
 - **NATS JetStream** persists messages and pushes them to gateway consumers.
 - **turbocable-server** fans out each message to all subscribers of that stream via a lock-free DashMap registry.
 
@@ -45,7 +46,7 @@ See [docs/architecture.md](docs/architecture.md) for the full system design.
 - **1M concurrent WebSocket connections** on a 3-node cluster (333k per node)
 - **Sub-50ms p99 fan-out latency** at full scale
 - **< 8 KB memory per connection**
-- **ActionCable-compatible** JSON protocol (`actioncable-v1-json`)
+- **JSON protocol** (`actioncable-v1-json` sub-protocol for broad client compatibility)
 - **MessagePack binary protocol** (`turbocable-v1-msgpack`) for reduced bandwidth
 - **RS256 JWT authentication** with hot-reloadable public keys via NATS KV
 - **Stream-level authorization** — glob patterns (`chat_room_*`, `*`) in JWT claims
@@ -135,7 +136,7 @@ All options can be set via CLI flags or environment variables:
 |------|-------------|
 | `GET /health` | Health check — returns `{"status":"ok","connections":N}` |
 | `GET /metrics` | Prometheus metrics in text exposition format |
-| `GET /pubkey` | Current RS256 public key PEM (for debugging key sync with Rails) |
+| `GET /pubkey` | Current RS256 public key PEM (for verifying JWT key distribution) |
 | `GET /cable` | WebSocket upgrade endpoint (pass `?token=<JWT>` when auth is enabled) |
 
 ## WebSocket Protocol
@@ -143,7 +144,7 @@ All options can be set via CLI flags or environment variables:
 ### Connecting
 
 ```bash
-# JSON sub-protocol (default, ActionCable-compatible)
+# JSON sub-protocol (default, actioncable-v1-json)
 wscat -c 'ws://localhost:9292/cable?token=<JWT>'
 
 # MessagePack binary sub-protocol
@@ -339,7 +340,7 @@ src/
 │   └── limiter.rs          # Per-IP connection limits
 ├── protocol/
 │   ├── types.rs            # ClientCommand / ServerMessage enums
-│   ├── json.rs             # ActionCable-compatible JSON codec
+│   ├── json.rs             # JSON codec (actioncable-v1-json sub-protocol)
 │   └── msgpack.rs          # Binary codec (rmp-serde)
 ├── pubsub/
 │   └── nats.rs             # NATS JetStream consumer, fan-out, publish, replay
@@ -361,7 +362,7 @@ src/
 | Package | Description |
 |---------|-------------|
 | [turbocable](https://github.com/samaswin/turbocable) | Ruby gem — NATS publisher for broadcasting |
-| [turbocable-rails](https://github.com/samaswin/turbocable-rails) | Rails DSL for TurboCable broadcasts |
+| [turbocable-rails](https://github.com/samaswin/turbocable-rails) | DSL for TurboCable broadcasts |
 | [@turbocable/client](https://github.com/samaswin/turbocable-client) | JavaScript client for browser connections |
 
 ## License

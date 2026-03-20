@@ -2,26 +2,26 @@
 
 ## Why TurboCable Exists
 
-Rails ActionCable works well at small scale, but it hits a hard ceiling around
-10k–50k concurrent WebSocket connections per process. Every connection lives
-inside a Ruby thread, memory grows linearly, and Redis pub/sub becomes the
-bottleneck. Scaling to 100k+ means running dozens of ActionCable processes,
-all backed by Redis, all contending on the same pub/sub channels.
+WebSocket servers hit a hard ceiling when connections grow. Most backend
+frameworks handle WebSockets in-process — each connection consumes a thread or
+coroutine, memory grows linearly, and the broadcast bus becomes the bottleneck.
+Scaling to 100k+ connections means running many backend processes, all contending
+on the same pub/sub channels.
 
 TurboCable takes a different approach: **move all WebSocket connections out of
-Ruby entirely**. A single Rust gateway process holds hundreds of thousands of
-connections. Rails publishes one NATS message per broadcast and moves on — it
-never touches WebSockets, never knows how many users are connected, and never
-becomes the bottleneck.
+your backend entirely**. A single Rust gateway process holds hundreds of thousands
+of connections. Your backend publishes one NATS message per broadcast and moves
+on — it never touches WebSockets, never knows how many users are connected, and
+never becomes the bottleneck.
 
 ### The core insight
 
 ```
-ActionCable:  1 broadcast → Ruby iterates N connections → N Redis messages → slow
+Traditional:  1 broadcast → backend iterates N connections → N pub/sub messages → slow
 TurboCable:   1 broadcast → 1 NATS publish → Rust fans out to N connections → fast
 ```
 
-Rails does O(1) work per broadcast. The Rust gateway does O(N) fan-out using
+Your backend does O(1) work per broadcast. The Rust gateway does O(N) fan-out using
 zero-copy `Bytes` cloning and lock-free `DashMap` shards — completing a fan-out
 to 333k connections in under 10ms.
 
@@ -39,10 +39,10 @@ to 333k connections in under 10ms.
 
 ```
 1. User sends a chat message
-   → Rails controller saves to DB
-   → Rails calls TurboCable.broadcast("chat_room_42", data)
+   → Backend server saves to DB
+   → Backend publishes to NATS subject TURBOCABLE.chat_room_42
 
-2. turbocable gem (Ruby)
+2. NATS publisher (e.g. turbocable gem)
    → MessagePack-encodes the payload
    → Publishes to NATS subject TURBOCABLE.chat_room_42
    → Returns in ~5μs (one TCP write)
@@ -69,8 +69,8 @@ to 333k connections in under 10ms.
 
 | Component | Responsibility | Does NOT do |
 |-----------|---------------|-------------|
-| **Rails app** | Business logic, DB writes, signs JWTs, publishes 1 NATS message per broadcast | Hold WebSocket connections, fan-out, presence |
-| **turbocable gem** | Thin NATS publisher wrapper for Ruby | WebSocket handling, connection management |
+| **Backend app** | Business logic, DB writes, signs JWTs, publishes 1 NATS message per broadcast | Hold WebSocket connections, fan-out, presence |
+| **NATS publisher** (e.g. turbocable gem) | Thin NATS publisher wrapper | WebSocket handling, connection management |
 | **NATS JetStream** | Message persistence, delivery guarantees, replay, KV storage for presence and keys | Fan-out to clients, authentication |
 | **Rust gateway** | Holds all WebSocket connections, JWT auth, fan-out, presence heartbeats, metrics | Business logic, DB access |
 | **JS client** | WebSocket connection, reconnect with backoff, message replay via sequence IDs | Server-side logic |
@@ -79,18 +79,18 @@ to 333k connections in under 10ms.
 
 ## Why Not Redis?
 
-ActionCable uses Redis pub/sub as the broadcast bus. At scale this creates
+Traditional WebSocket servers use Redis pub/sub as the broadcast bus. At scale this creates
 problems:
 
 | | Redis pub/sub | NATS JetStream |
 |---|---|---|
 | **Message persistence** | Fire-and-forget — if subscriber is offline, message is lost | Persisted to disk, 7-day retention |
 | **Replay on reconnect** | Not possible — must re-fetch from DB | Built-in: client sends `last_seq`, gateway replays |
-| **Fan-out** | Redis broadcasts to all subscribers, each Ruby process re-fans to its connections | NATS delivers once to gateway, Rust fans out in-process |
+| **Fan-out** | Redis broadcasts to all subscribers, each backend process re-fans to its connections | NATS delivers once to gateway, Rust fans out in-process |
 | **Memory** | Redis holds all pub/sub state in memory | NATS uses file-backed storage, memory only for hot data |
 | **Operational cost** | Redis cluster + Sentinel for HA | NATS cluster is self-healing, no external coordination |
 
-Removing Redis simplifies the stack to: **Rails → NATS → Rust gateway**.
+Removing Redis simplifies the stack to: **Backend → NATS → Rust gateway**.
 
 ---
 
@@ -145,7 +145,7 @@ src/
 ├── presence/               # NATS KV-backed presence tracking (TTL-based)
 ├── protocol/
 │   ├── types.rs            # ClientCommand / ServerMessage enums
-│   ├── json.rs             # ActionCable-compatible JSON codec
+│   ├── json.rs             # JSON codec (actioncable-v1-json sub-protocol)
 │   └── msgpack.rs          # Binary codec (rmp-serde)
 └── pubsub/
     └── nats.rs             # NatsConsumer: fanout, publish, replay
@@ -229,7 +229,7 @@ See [NATS JetStream Integration](nats-jetstream.md) for full details.
 ## Authentication Flow
 
 ```
-Rails app                            Gateway
+Backend app                          Gateway
     │                                   │
     │  Signs JWT with RS256 private key │
     │  Claims: { sub, allowed_streams,  │
@@ -275,7 +275,7 @@ The client requests a sub-protocol via the `Sec-WebSocket-Protocol` header:
 
 | Sub-protocol | Format | Use case |
 |--------------|--------|----------|
-| `actioncable-v1-json` | JSON text frames | Development, debugging, ActionCable migration |
+| `actioncable-v1-json` | JSON text frames | Development, debugging, broad client compatibility |
 | `turbocable-v1-msgpack` | Binary MessagePack frames | Production (smaller, faster) |
 
 If no sub-protocol is requested, JSON is used as the default.
@@ -283,7 +283,7 @@ If no sub-protocol is requested, JSON is used as the default.
 ### NATS subject mapping
 
 ```
-Rails:    TurboCable.broadcast("chat_room_42", data)
+Backend:  publish to NATS subject TURBOCABLE.chat_room_42
 NATS:     TURBOCABLE.chat_room_42
 Gateway:  strip prefix → "chat_room_42" → registry.fanout()
 Client:   subscribe to "chat_room_42"
@@ -311,7 +311,7 @@ NATS cluster:
   RAM:    8 GB each
   Storage: SSD, 100 GB each
 
-Rails:
+Backend:
   Existing cluster — no changes needed
   1 persistent NATS connection per process
 ```
@@ -328,17 +328,15 @@ Rails:
 
 ---
 
-## Comparison with ActionCable
+## Comparison: Traditional vs TurboCable
 
-| | ActionCable | TurboCable |
+| | Traditional WebSocket Server | TurboCable |
 |---|---|---|
-| **Language** | Ruby | Rust gateway + Ruby publisher |
 | **Max connections (single process)** | ~10k–50k | ~333k |
-| **Max connections (cluster)** | Depends on Redis | 1M (3 nodes) |
+| **Max connections (cluster)** | Depends on pub/sub bus | 1M (3 nodes) |
 | **Message bus** | Redis pub/sub | NATS JetStream |
-| **Message persistence** | None | 7-day retention |
+| **Message persistence** | Fire-and-forget | 7-day retention |
 | **Reconnect replay** | Not supported | Built-in (sequence-based) |
 | **Memory per connection** | ~50–100 KB | ~6–8 KB |
-| **Fan-out model** | Ruby iterates connections | Zero-copy Bytes in Rust |
-| **WebSocket handling** | In Ruby process | Dedicated Rust binary |
-| **Rails changes needed** | None (built-in) | Add gem + config, swap broadcast calls |
+| **Fan-out model** | Backend iterates connections | Zero-copy Bytes in Rust |
+| **WebSocket handling** | In backend process | Dedicated Rust binary |

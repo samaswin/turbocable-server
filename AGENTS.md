@@ -39,6 +39,54 @@ wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo fmt --check 2
 | Windows   | `C:\Users\aswin\Git\turbocable-server`      |
 | WSL       | `/mnt/c/Users/aswin/Git/turbocable-server`  |
 
+## Task Completion Requirement
+
+After completing any task, **all agents must run the format check** and fix any issues before considering the task done:
+
+```bash
+wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo fmt --all --check 2>&1"
+```
+
+If the check fails, run `cargo fmt --all` to fix formatting, then re-verify:
+
+```bash
+wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo fmt --all 2>&1"
+```
+
+Also run `cargo doc` to ensure documentation builds without errors:
+
+```bash
+wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo doc 2>&1"
+```
+
+Also run `cargo audit` to check for known vulnerabilities in dependencies:
+
+```bash
+wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo audit 2>&1"
+```
+
+If vulnerabilities are found, fix them by updating the affected dependencies:
+
+```bash
+wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo update 2>&1"
+```
+
+If `cargo update` does not resolve the vulnerability (e.g. it requires a major version bump), manually update the dependency version in `Cargo.toml` and run `cargo update` again. Re-run `cargo audit` to confirm all vulnerabilities are resolved before considering the task done.
+
+## Installation Requirements
+
+If a task requires installing new tools, packages, or dependencies (e.g. `cargo install`, `apt install`, system tools), the agent **must not attempt the installation itself**. Instead:
+
+1. Identify what needs to be installed and why.
+2. Provide the exact commands and steps the user should run.
+3. Ask the user to perform the installation, then resume the task once confirmed.
+
+**Example:**
+> "This task requires `cargo-expand`. Please run the following in WSL, then let me know when done:"
+> ```bash
+> wsl bash -ic "cargo install cargo-expand"
+> ```
+
 ## Tool Versions (from `.tool-versions`)
 
 | Tool  | Version  | Managed by |

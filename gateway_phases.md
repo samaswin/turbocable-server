@@ -504,7 +504,7 @@ Used by Rails to verify it and the gateway are in sync during debugging.
 
 ---
 
-## Phase 8 — Graceful Shutdown
+## Phase 8 — Graceful Shutdown - Completed
 **Goal:** SIGTERM drains connections cleanly. No lost messages during deploy.
 **Duration:** 1 day
 **Done when:** `kill -TERM <pid>` closes all connections with WS close(1001) within 30s.
@@ -544,10 +544,10 @@ On disconnect: delete key (best-effort).
 Heartbeat: gateway refreshes TTL every 25s for connected clients.
 
 ### 9.2 Phase 9 Checklist
-- [ ] Presence key written on subscribe
-- [ ] Presence key deleted on unsubscribe/disconnect
-- [ ] Key expires naturally (30s TTL) if gateway crashes — no stale presence
-- [ ] Heartbeat prevents premature expiry for long-lived connections
+- [x] Presence key written on subscribe
+- [x] Presence key deleted on unsubscribe/disconnect
+- [x] Key expires naturally (30s TTL) if gateway crashes — no stale presence
+- [x] Heartbeat prevents premature expiry for long-lived connections
 
 ---
 

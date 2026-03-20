@@ -17,6 +17,7 @@ use crate::auth::jwt::{self, JwtVerifier};
 use crate::connection::limiter::ConnectionLimiter;
 use crate::connection::registry::Registry;
 use crate::metrics::Metrics;
+use crate::presence::{HeartbeatHandle, PresenceManager};
 use crate::protocol::types::{ClientCommand, ServerMessage};
 use crate::protocol::{self, Codec, SUB_PROTOCOL_JSON, SUB_PROTOCOL_MSGPACK};
 use crate::pubsub::nats::NatsConsumer;
@@ -43,6 +44,8 @@ pub struct AppState {
     pub jwt_verifier: Option<Arc<JwtVerifier>>,
     /// NATS JetStream consumer for publishing and replay (absent when NATS is unavailable).
     pub nats_consumer: Option<Arc<NatsConsumer>>,
+    /// Presence manager backed by NATS KV (absent when NATS is unavailable).
+    pub presence: Option<Arc<PresenceManager>>,
     /// Prometheus metrics handle.
     pub metrics: Arc<Metrics>,
     /// Shutdown broadcast: resolves to `true` when the server is draining.
@@ -123,7 +126,7 @@ async fn handle_socket(
         return;
     }
 
-    let allowed_streams = if let Some(ref verifier) = state.jwt_verifier {
+    let (allowed_streams, user_id) = if let Some(ref verifier) = state.jwt_verifier {
         let token_str = match token.as_deref() {
             Some(t) if !t.is_empty() => t,
             _ => {
@@ -150,7 +153,8 @@ async fn handle_socket(
         match result {
             Ok(claims) => {
                 tracing::debug!(%ip, sub = %claims.sub, "JWT verified");
-                claims.allowed_streams
+                let user_id = claims.sub.clone();
+                (claims.allowed_streams, Some(user_id))
             }
             Err(e) => {
                 tracing::warn!(%ip, error = %e, "connection rejected: JWT verification failed");
@@ -167,7 +171,7 @@ async fn handle_socket(
             }
         }
     } else {
-        vec![String::from("*")]
+        (vec![String::from("*")], None)
     };
 
     let codec = protocol::codec_for_protocol(protocol).expect("negotiated protocol must be valid");
@@ -203,6 +207,7 @@ async fn handle_socket(
         conn_id,
         &state,
         &allowed_streams,
+        user_id.as_deref(),
         state.shutdown_rx.clone(),
     )
     .await;
@@ -285,6 +290,7 @@ async fn inbound_loop(
     conn_id: u64,
     state: &AppState,
     allowed_streams: &[String],
+    user_id: Option<&str>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut ping_interval = tokio::time::interval(Duration::from_secs(state.ping_interval_secs));
@@ -294,6 +300,11 @@ async fn inbound_loop(
     // Set once per connection, consumed during subsequent subscribe commands.
     let mut last_seq: Option<u64> = None;
 
+    // Tracks active heartbeat tasks keyed by stream name.
+    // Dropping a HeartbeatHandle automatically aborts the background task.
+    let mut heartbeats: std::collections::HashMap<String, HeartbeatHandle> =
+        std::collections::HashMap::new();
+
     loop {
         tokio::select! {
             msg = receiver.next() => {
@@ -301,13 +312,15 @@ async fn inbound_loop(
                     Some(Ok(Message::Text(ref text))) => {
                         handle_client_frame(
                             text.as_bytes(), codec, is_binary, conn_id,
-                            tx, state, allowed_streams, &mut last_seq,
+                            tx, state, allowed_streams, user_id, &mut last_seq,
+                            &mut heartbeats,
                         ).await;
                     }
                     Some(Ok(Message::Binary(ref data))) => {
                         handle_client_frame(
                             data, codec, is_binary, conn_id,
-                            tx, state, allowed_streams, &mut last_seq,
+                            tx, state, allowed_streams, user_id, &mut last_seq,
+                            &mut heartbeats,
                         ).await;
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
@@ -335,6 +348,14 @@ async fn inbound_loop(
             }
         }
     }
+
+    // Clean up presence for all remaining subscriptions on disconnect.
+    if let (Some(uid), Some(presence)) = (user_id, state.presence.as_ref()) {
+        for stream in heartbeats.keys() {
+            presence.delete(stream, uid).await;
+        }
+    }
+    // Dropping `heartbeats` aborts all heartbeat tasks.
 }
 
 async fn handle_client_frame(
@@ -345,7 +366,9 @@ async fn handle_client_frame(
     tx: &mpsc::Sender<Bytes>,
     state: &AppState,
     allowed_streams: &[String],
+    user_id: Option<&str>,
     last_seq: &mut Option<u64>,
+    heartbeats: &mut std::collections::HashMap<String, HeartbeatHandle>,
 ) {
     match codec.decode(data) {
         Ok(cmd) => {
@@ -368,6 +391,19 @@ async fn handle_client_frame(
 
                     state.registry.subscribe(conn_id, &identifier);
 
+                    // Write presence entry and start heartbeat (if presence is configured).
+                    if let (Some(uid), Some(presence)) = (user_id, state.presence.as_ref()) {
+                        presence.put(&identifier, uid).await;
+                        let handle = presence.start_heartbeat(identifier.clone(), uid.to_string());
+                        heartbeats.insert(identifier.clone(), handle);
+                        tracing::debug!(
+                            conn_id,
+                            stream = identifier,
+                            user_id = uid,
+                            "presence written"
+                        );
+                    }
+
                     // Replay missed messages when client reconnected with last_seq.
                     // Happens before confirm so the client receives replayed messages first.
                     if let Some(seq) = *last_seq {
@@ -382,6 +418,18 @@ async fn handle_client_frame(
                 }
                 ClientCommand::Unsubscribe { identifier } => {
                     state.registry.unsubscribe(conn_id, &identifier);
+
+                    // Remove heartbeat (aborts task) and delete presence key.
+                    if let (Some(uid), Some(presence)) = (user_id, state.presence.as_ref()) {
+                        heartbeats.remove(&identifier); // Drop aborts heartbeat task.
+                        presence.delete(&identifier, uid).await;
+                        tracing::debug!(
+                            conn_id,
+                            stream = identifier,
+                            user_id = uid,
+                            "presence removed"
+                        );
+                    }
                 }
                 ClientCommand::Message {
                     identifier,

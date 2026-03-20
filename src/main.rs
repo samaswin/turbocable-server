@@ -13,6 +13,7 @@ mod config;
 mod connection;
 mod errors;
 mod metrics;
+mod presence;
 mod protocol;
 mod pubsub;
 mod server;

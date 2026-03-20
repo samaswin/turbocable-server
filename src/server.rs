@@ -17,6 +17,7 @@ use crate::connection::handler::{ws_upgrade, AppState};
 use crate::connection::limiter::ConnectionLimiter;
 use crate::connection::registry::Registry;
 use crate::metrics::Metrics;
+use crate::presence::PresenceManager;
 use crate::pubsub::nats::NatsConsumer;
 
 /// Maximum time in seconds to wait for WebSocket connections to drain after SIGTERM.
@@ -39,6 +40,7 @@ pub async fn run(cfg: Config) {
 
     let jwt_verifier = init_jwt_verifier(&cfg).await;
     let nats_consumer = init_nats_consumer(&cfg, &registry, Arc::clone(&metrics)).await;
+    let presence = init_presence(&cfg).await;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -48,6 +50,7 @@ pub async fn run(cfg: Config) {
         ping_interval_secs: cfg.ping_interval_secs,
         jwt_verifier,
         nats_consumer: nats_consumer.clone(),
+        presence,
         metrics,
         shutdown_rx,
     };
@@ -93,7 +96,10 @@ pub async fn run(cfg: Config) {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            tracing::warn!(remaining, "drain timeout: force-closing remaining connections");
+            tracing::warn!(
+                remaining,
+                "drain timeout: force-closing remaining connections"
+            );
             break;
         }
         tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
@@ -116,7 +122,8 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
         tokio::select! {
             _ = sigterm.recv() => { tracing::info!("SIGTERM received"); }
             _ = tokio::signal::ctrl_c() => { tracing::info!("Ctrl-C received"); }
@@ -223,6 +230,26 @@ async fn init_nats_consumer(
                 nats_url = %cfg.nats_url,
                 error = %e,
                 "NATS JetStream unavailable — running without pub/sub"
+            );
+            None
+        }
+    }
+}
+
+/// Connects to NATS and opens the `TC_PRESENCE` KV bucket for presence tracking.
+///
+/// Returns `None` if NATS is unavailable — the gateway runs without presence in that case.
+async fn init_presence(cfg: &Config) -> Option<Arc<PresenceManager>> {
+    match PresenceManager::connect(&cfg.nats_url).await {
+        Ok(presence) => {
+            tracing::info!(nats_url = %cfg.nats_url, "presence KV manager active (TC_PRESENCE)");
+            Some(presence)
+        }
+        Err(e) => {
+            tracing::warn!(
+                nats_url = %cfg.nats_url,
+                error = %e,
+                "presence KV unavailable — running without presence tracking"
             );
             None
         }

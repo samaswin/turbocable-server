@@ -10,6 +10,8 @@ This directory contains everything needed to validate Phase 10 targets:
 | Memory | Per connection | < 8 KB |
 | Message loss | Sequence gaps | 0 |
 
+High-level guide (phases, compose stacks, prerequisites): [docs/load-testing-1m.md](../docs/load-testing-1m.md).
+
 ---
 
 ## Directory Layout
@@ -17,18 +19,41 @@ This directory contains everything needed to validate Phase 10 targets:
 ```
 bench/
 ├── k6/
-│   └── load_1m.js          Main k6 WebSocket load test
+│   ├── load_1m.js           Main k6 WebSocket load test (Phase 10.1 / 10.2)
+│   └── reconnect_test.js    Reconnect + replay validation (Phase 2)
 └── scripts/
-    ├── run_single_node.sh   Phase 10.1 — single-node test runner
-    ├── run_cluster.sh       Phase 10.2 — cluster test runner (one per agent)
-    ├── memory_profile.sh    Phase 10.3 — RSS / per-connection memory monitor
-    └── tune_os.sh           One-time OS tuning (fd limits, somaxconn)
+    ├── run_single_node.sh      Phase 10.1 — single-node test runner
+    ├── run_cluster.sh          Phase 10.2 — cluster test runner (one per agent)
+    ├── crash_recovery_test.sh  Phase 3   — SIGKILL + restart, verify zero data loss
+    ├── memory_profile.sh       Phase 10.3 — RSS / per-connection memory monitor
+    └── tune_os.sh              One-time OS tuning (fd limits, somaxconn)
 
 benches/
 └── registry_bench.rs        Criterion micro-benchmarks (in-process fanout)
 
 src/bin/
 └── publish.rs               tc-publish — NATS message publisher for fanout testing
+
+infra/
+├── docker-compose.nats.yml     3-node NATS JetStream cluster (replicas=3, FileStorage)
+├── docker-compose.cluster.yml  Full stack: 3 gateways + nginx lb (needs nats compose)
+├── nginx.conf                  Production nginx — SSL termination, least_conn WS LB
+├── nginx-local.conf            Plain HTTP nginx — used by docker-compose.cluster.yml
+├── nats/
+│   ├── nats1.conf              NATS node n1 config
+│   ├── nats2.conf              NATS node n2 config
+│   └── nats3.conf              NATS node n3 config
+├── alertmanager/
+│   ├── turbocable.rules.yml    Prometheus alerting rules (lag, drop, latency)
+│   └── alertmanager.yml        Alertmanager routing (PagerDuty + Slack template)
+├── docker-compose.monitoring.yml  Prometheus + Alertmanager + Grafana stack
+├── prometheus/
+│   └── prometheus.yml          Scrape config for all 3 gateways + NATS
+└── grafana/
+    ├── turbocable_dashboard.json   Grafana dashboard (connections, latency, consumer lag)
+    └── provisioning/
+        ├── datasources/prometheus.yml
+        └── dashboards/dashboards.yml
 ```
 
 ---
@@ -51,18 +76,43 @@ cargo build --release --bin tc-publish
 
 ### 3. Install k6
 
-Follow the [official k6 install guide](https://k6.io/docs/getting-started/installation/).
+The apt keyserver method is unreliable on some systems. Use the direct binary download instead:
 
 ```bash
-# Ubuntu / Debian
-sudo gpg --no-default-keyring \
-  --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
-  --keyserver hkp://keyserver.ubuntu.com:80 \
-  --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+# Direct binary download (recommended)
+curl -L https://github.com/grafana/k6/releases/download/v0.55.0/k6-v0.55.0-linux-amd64.tar.gz \
+  -o /tmp/k6.tar.gz && \
+tar -xzf /tmp/k6.tar.gz -C /tmp && \
+sudo mv /tmp/k6-v0.55.0-linux-amd64/k6 /usr/local/bin/k6 && \
+k6 version
+```
+
+Alternatively, use the apt repo (may fail if keyserver is unreachable):
+```bash
+curl -s https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
   | sudo tee /etc/apt/sources.list.d/k6.list
 sudo apt-get update && sudo apt-get install k6
 ```
+
+### 4. Start the gateway with a high per-IP limit
+
+The gateway defaults to 10 connections per IP. All k6 VUs on the same machine
+share one IP (`127.0.0.1`), so you **must** raise this limit before any load test:
+
+```bash
+# Smoke test / single-node
+RUST_LOG=info ./target/release/turbocable-server --port 9292 --max-connections-per-ip 5000
+
+# Full 333k test (all connections from localhost)
+RUST_LOG=info ./target/release/turbocable-server --port 9292 --max-connections-per-ip 400000
+
+# Or via environment variable
+TURBOCABLE_MAX_CONN_PER_IP=400000 ./target/release/turbocable-server --port 9292
+```
+
+Without this, the gateway will reject connections after the first 10 from the same IP
+and the k6 `tc_connect_success` rate will drop to ~33%.
 
 ---
 
@@ -100,6 +150,117 @@ Timestamp                 conns    rss(kB)    per(kB)
 -----------------------------------------------------------
 2024-01-15 12:00:00       333142   2548736      7.6
 ```
+
+---
+
+## Phase 2 — Reconnect + Replay Validation
+
+**Target:** 100 VUs reconnect after a 5 s gap with zero sequence gaps.
+
+```bash
+# Terminal 1 — NATS
+nats-server --jetstream
+
+# Terminal 2 — Gateway (raise per-IP limit so all VUs can connect from localhost)
+RUST_LOG=info ./target/release/turbocable-server --port 9292 --max-connections-per-ip 200
+
+# Terminal 3 — tc-publish (must be running before k6 starts)
+./target/release/tc-publish --stream bench --rate 1 --duration 120
+
+# Terminal 4 — Reconnect test
+k6 run bench/k6/reconnect_test.js
+```
+
+Or with custom parameters:
+
+```bash
+k6 run bench/k6/reconnect_test.js \
+  -e TARGET=100 \
+  -e GATEWAY_WSS_URL=ws://localhost:9292/cable \
+  -e PHASE1_DURATION_S=30 \
+  -e RECONNECT_GAP_S=5 \
+  -e PHASE2_DURATION_S=60
+```
+
+**What it tests:**
+- Each VU connects and subscribes, recording the last JetStream sequence seen.
+- After 30 s all VUs disconnect simultaneously.
+- After a 5 s offline gap, each VU reconnects and sends
+  `{"type":"hello","last_seq":"N"}` followed by a re-subscribe.
+- The server replays missed messages (`replayed: true`) before confirming the
+  subscription; live messages then resume seamlessly.
+- `tc_sequence_gaps` must remain `0` — any gap means a message was never
+  delivered even after replay.
+
+**Pass criteria:**
+```
+tc_sequence_gaps count     == 0    (no message loss after replay)
+tc_connect_success rate    > 0.99
+tc_reconnect_success rate  > 0.99
+tc_connection_errors count < 10
+```
+
+**Custom metrics emitted:**
+
+| Metric | Description |
+|--------|-------------|
+| `tc_fanout_latency_ms` | p50/p95/p99 latency for live (non-replayed) messages |
+| `tc_messages_received` | Total messages received (phase 1 + replay + phase 2 live) |
+| `tc_replayed_messages` | Messages delivered with `replayed=true` after reconnect |
+| `tc_sequence_gaps` | Missing seqs not covered by replay (must be 0) |
+| `tc_connect_success` | Rate of successful initial WS upgrades |
+| `tc_reconnect_success` | Rate of successful reconnect WS upgrades |
+| `tc_connection_errors` | Total connection errors across both phases |
+
+---
+
+## Phase 3 — Crash Recovery Test
+
+**Target:** Zero data loss across a hard SIGKILL of the gateway mid-stream.
+
+```bash
+# Terminal 1 — NATS
+nats-server --jetstream
+
+# Terminal 2 — Run the crash recovery test (uses fixed node_id internally)
+bash bench/scripts/crash_recovery_test.sh
+```
+
+Or with custom parameters:
+
+```bash
+N_MESSAGES=200 PUBLISH_RATE=5 bash bench/scripts/crash_recovery_test.sh
+```
+
+**What it tests:**
+- Starts the gateway with a fixed `--node-id` (`crash-test-node` by default) so
+  the durable consumer name is known: `gw_crash-test-node`.
+- Publishes `N_MESSAGES` messages at `PUBLISH_RATE` msg/s via tc-publish.
+- After `KILL_AFTER_S` seconds (≈ half the messages), sends SIGKILL to the gateway.
+- Restarts the gateway with the **same** node-id so it finds the existing durable
+  consumer and resumes from the last ACK position.
+- Waits up to `WAIT_TIMEOUT_S` seconds for `nats consumer info` to report
+  `num_pending = 0`.
+
+**Pass criterion:**
+```
+num_pending == 0   after gateway restarts
+```
+This means all messages published during and after the crash window were eventually
+delivered — the durable consumer replayed from its last ACK position.
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NATS_URL` | `nats://localhost:4222` | NATS server URL |
+| `GATEWAY_PORT` | `9292` | Gateway HTTP/WS port |
+| `STREAM` | `bench` | JetStream stream name |
+| `NODE_ID` | `crash-test-node` | Fixed gateway node-id (determines consumer name) |
+| `N_MESSAGES` | `100` | Total messages to publish |
+| `PUBLISH_RATE` | `2` | Messages per second |
+| `KILL_AFTER_S` | `N/rate/2` | Seconds before SIGKILL |
+| `WAIT_TIMEOUT_S` | `60` | Max seconds to wait for `num_pending=0` |
 
 ---
 

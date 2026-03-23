@@ -1,0 +1,185 @@
+## TurboCable — Prometheus Alerting Rules
+##
+## Load into Prometheus by adding this file to your rule_files: list in
+## prometheus.yml, or mount it into the infra/docker-compose.monitoring.yml stack.
+##
+## Severity levels:
+##   warning  — investigate soon; not yet user-visible
+##   critical — user-visible degradation; page on-call immediately
+
+groups:
+  - name: turbocable.nats
+    rules:
+
+      # ── NATS consumer lag ────────────────────────────────────────────────────
+      #
+      # The durable consumer accumulates pending messages when the gateway
+      # falls behind the publish rate.  >10k means the gateway is more than
+      # 10,000 messages behind — fan-out latency will spike.
+
+      - alert: NatsConsumerLagHigh
+        expr: turbocable_nats_consumer_lag > 10000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NATS consumer lag is high ({{ $value | humanize }} pending)"
+          description: >
+            Gateway {{ $labels.instance }} has {{ $value | humanize }} unacknowledged
+            NATS messages.  Fan-out latency will increase.
+            Check publish rate vs. gateway throughput.
+            Run: nats consumer info TURBOCABLE gw_<node_id>
+
+      - alert: NatsConsumerLagCritical
+        expr: turbocable_nats_consumer_lag > 50000
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NATS consumer lag is critical ({{ $value | humanize }} pending)"
+          description: >
+            Gateway {{ $labels.instance }} is severely behind with
+            {{ $value | humanize }} pending NATS messages.
+            Clients are experiencing significant message delay.
+            Consider scaling up gateway instances or reducing publish rate.
+
+  - name: turbocable.connections
+    rules:
+
+      # ── Sudden connection drop ───────────────────────────────────────────────
+      #
+      # Fires when connections_active drops more than 5% in 1 minute.
+      # Protects against: gateway crash, network partition, load balancer failure.
+      # Guard clause (> 1000) prevents false positives during low-traffic periods.
+
+      - alert: ConnectionsDropping
+        expr: >
+          (turbocable_connections_active offset 1m - turbocable_connections_active)
+          / turbocable_connections_active offset 1m > 0.05
+          and turbocable_connections_active offset 1m > 1000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Active connections dropped > 5% in the last minute"
+          description: >
+            Gateway {{ $labels.instance }} dropped from
+            {{ with query "turbocable_connections_active offset 1m{instance=\"{{$labels.instance}}\"}" }}{{ . | first | value | humanize }}{{ end }}
+            to {{ $value | humanize }} connections (> 5% drop).
+            Check for gateway restarts, LB health-check failures, or client errors.
+
+      - alert: ConnectionsCollapsingCritical
+        expr: >
+          (turbocable_connections_active offset 1m - turbocable_connections_active)
+          / turbocable_connections_active offset 1m > 0.20
+          and turbocable_connections_active offset 1m > 1000
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Active connections dropped > 20% in the last minute"
+          description: >
+            Gateway {{ $labels.instance }} lost more than 20% of its connections
+            in 1 minute.  This likely indicates a gateway crash or total network
+            failure.  Investigate immediately.
+
+      # ── High rejection rate ──────────────────────────────────────────────────
+      #
+      # Fires when more than 5% of new connection attempts are being rejected
+      # (auth failure or per-IP rate limit).
+
+      - alert: ConnectionRejectionRateHigh
+        expr: >
+          rate(turbocable_connections_rejected_total[2m])
+          / (rate(turbocable_connections_total[2m]) + rate(turbocable_connections_rejected_total[2m]))
+          > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of connections are being rejected"
+          description: >
+            Gateway {{ $labels.instance }} is rejecting
+            {{ $value | humanizePercentage }} of connection attempts.
+            Check JWT key rotation, per-IP limits, or client misconfiguration.
+
+  - name: turbocable.fanout
+    rules:
+
+      # ── Fan-out latency ──────────────────────────────────────────────────────
+      #
+      # p99 fan-out latency targets:
+      #   single node   < 30 ms
+      #   3-node cluster < 50 ms
+      # These alerts fire at the cluster threshold.
+
+      - alert: FanoutLatencyHigh
+        expr: >
+          histogram_quantile(0.99,
+            rate(turbocable_fanout_duration_seconds_bucket[2m])
+          ) > 0.050
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fan-out p99 latency > 50 ms"
+          description: >
+            Gateway {{ $labels.instance }} p99 fan-out latency is
+            {{ $value | humanizeDuration }}.
+            Check NATS consumer lag, CPU saturation, or channel back-pressure.
+
+      - alert: FanoutLatencyCritical
+        expr: >
+          histogram_quantile(0.99,
+            rate(turbocable_fanout_duration_seconds_bucket[2m])
+          ) > 0.200
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fan-out p99 latency > 200 ms — SLO breach"
+          description: >
+            Gateway {{ $labels.instance }} p99 fan-out latency is
+            {{ $value | humanizeDuration }}, which breaches the 1M-connection SLO.
+
+      # ── Message drop rate ────────────────────────────────────────────────────
+      #
+      # Messages are dropped when a client's outbound channel is full (slow client).
+      # A non-zero drop rate is normal under extreme back-pressure but any
+      # sustained drop rate indicates clients are falling behind.
+
+      - alert: MessageDropRateNonZero
+        expr: rate(turbocable_messages_dropped_total[2m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Messages are being dropped (slow clients)"
+          description: >
+            Gateway {{ $labels.instance }} is dropping
+            {{ $value | humanize }} messages/s.
+            Slow clients are not draining their outbound channels.
+            Consider reducing publish rate or increasing channel capacity.
+
+  - name: turbocable.auth
+    rules:
+
+      # ── JWT auth latency ─────────────────────────────────────────────────────
+      #
+      # JWT verification should be fast (< 1 ms typical).  Spikes indicate
+      # key-reload contention or NATS KV latency issues.
+
+      - alert: AuthLatencyHigh
+        expr: >
+          histogram_quantile(0.99,
+            rate(turbocable_auth_duration_seconds_bucket[2m])
+          ) > 0.010
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "JWT auth p99 latency > 10 ms"
+          description: >
+            Gateway {{ $labels.instance }} p99 JWT verification latency is
+            {{ $value | humanizeDuration }}.
+            Check NATS KV latency or key-reload frequency.

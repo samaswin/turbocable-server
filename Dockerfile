@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.4
-#
 # Builds a fully-static x86_64 Linux binary via musl and packages it into a
 # minimal scratch image (~12 MB).  For multi-platform releases the CI pipeline
 # uses Dockerfile.dist with pre-built cross-compiled binaries instead.

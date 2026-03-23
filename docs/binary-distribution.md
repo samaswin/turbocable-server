@@ -69,7 +69,7 @@ docker run -p 9292:9292 \
 ```
 
 Pass any configuration via environment variables — see the
-[Configuration Reference](setup.md#configuration-reference) for all options.
+[Configuration and HTTP API](configuration.md) for all options.
 
 ### Image details
 

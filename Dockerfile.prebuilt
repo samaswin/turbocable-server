@@ -1,0 +1,17 @@
+# Dockerfile.prebuilt — packages a pre-compiled musl binary into a scratch image.
+#
+# Use this when Docker cannot reach the internet to pull rust:1.88-slim
+# (e.g. WSL2 BuildKit networking issues).
+#
+# Prerequisites — build the static binary in WSL first:
+#   wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && \
+#     rustup target add x86_64-unknown-linux-musl && \
+#     cargo build --release --target x86_64-unknown-linux-musl"
+#
+# Then build the image (no network needed):
+#   docker build -f Dockerfile.prebuilt -t turbocable-server:latest .
+
+FROM scratch
+COPY target/x86_64-unknown-linux-musl/release/turbocable-server /gateway
+EXPOSE 9292
+ENTRYPOINT ["/gateway"]

@@ -1,0 +1,64 @@
+# TurboCable — Alertmanager configuration template
+#
+# Replace the placeholder values (marked with <...>) before deploying.
+# Used by infra/docker-compose.monitoring.yml.
+#
+# Routing:
+#   critical → PagerDuty (immediate page)
+#   warning  → Slack #turbocable-alerts
+
+global:
+  resolve_timeout: 5m
+
+  # PagerDuty — replace with your integration key
+  # pagerduty_url: https://events.pagerduty.com/v2/enqueue
+
+  # Slack — replace with your webhook URL
+  # slack_api_url: https://hooks.slack.com/services/<YOUR_WEBHOOK>
+
+route:
+  receiver: slack-warnings        # default receiver
+  group_by: [alertname, instance]
+  group_wait:      30s
+  group_interval:  5m
+  repeat_interval: 4h
+
+  routes:
+    - matchers:
+        - severity = critical
+      receiver: pagerduty-critical
+      continue: true              # also send to Slack for visibility
+
+    - matchers:
+        - severity = warning
+      receiver: slack-warnings
+
+receivers:
+  - name: pagerduty-critical
+    pagerduty_configs:
+      - routing_key: <PAGERDUTY_INTEGRATION_KEY>
+        description: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+        details:
+          description: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+          firing:       '{{ .Alerts.Firing | len }}'
+
+  - name: slack-warnings
+    slack_configs:
+      - api_url: <SLACK_WEBHOOK_URL>
+        channel: '#turbocable-alerts'
+        title: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
+        text: >-
+          {{ range .Alerts }}
+          *{{ .Annotations.summary }}*
+          {{ .Annotations.description }}
+          {{ end }}
+        send_resolved: true
+
+inhibit_rules:
+  # Suppress warning-level alerts when a critical alert for the same instance
+  # is already firing — avoid duplicate noise.
+  - source_matchers:
+      - severity = critical
+    target_matchers:
+      - severity = warning
+    equal: [alertname, instance]

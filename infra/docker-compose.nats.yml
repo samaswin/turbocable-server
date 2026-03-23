@@ -1,0 +1,89 @@
+# TurboCable — 3-node NATS JetStream cluster
+#
+# Provides production-grade no-data-loss for the gateway.  With replicas=3 a
+# message is durable even if one NATS node crashes — the other two nodes hold
+# a complete copy of every JetStream stream.
+#
+# Usage:
+#   docker compose -f infra/docker-compose.nats.yml up -d
+#
+# Gateway connection string (set on every gateway node):
+#   TURBOCABLE_NATS_URL=nats://localhost:4222,nats://localhost:4223,nats://localhost:4224
+#   TURBOCABLE_NATS_STREAM_REPLICAS=3
+#
+# Verify the cluster formed:
+#   nats server list --server nats://localhost:4222
+#   nats server info --server nats://localhost:4222
+#
+# Monitoring dashboards (after cluster is up):
+#   http://localhost:8222/varz    — nats1
+#   http://localhost:8223/varz    — nats2
+#   http://localhost:8224/varz    — nats3
+
+services:
+  nats1:
+    image: nats:2.10-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    ports:
+      - "4222:4222"   # client connections (primary endpoint)
+      - "8222:8222"   # HTTP monitoring
+    volumes:
+      - ./nats/nats1.conf:/etc/nats/nats.conf:ro
+      - nats1-data:/data/nats
+    networks:
+      - nats-cluster
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nats-server", "--healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nats2:
+    image: nats:2.10-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    ports:
+      - "4223:4222"   # client connections
+      - "8223:8222"   # HTTP monitoring
+    volumes:
+      - ./nats/nats2.conf:/etc/nats/nats.conf:ro
+      - nats2-data:/data/nats
+    networks:
+      - nats-cluster
+    restart: unless-stopped
+    depends_on:
+      - nats1
+    healthcheck:
+      test: ["CMD", "nats-server", "--healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nats3:
+    image: nats:2.10-alpine
+    command: ["-c", "/etc/nats/nats.conf"]
+    ports:
+      - "4224:4222"   # client connections
+      - "8224:8222"   # HTTP monitoring
+    volumes:
+      - ./nats/nats3.conf:/etc/nats/nats.conf:ro
+      - nats3-data:/data/nats
+    networks:
+      - nats-cluster
+    restart: unless-stopped
+    depends_on:
+      - nats1
+    healthcheck:
+      test: ["CMD", "nats-server", "--healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  nats1-data:
+  nats2-data:
+  nats3-data:
+
+networks:
+  nats-cluster:
+    driver: bridge

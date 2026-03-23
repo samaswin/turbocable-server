@@ -8,14 +8,16 @@ locally.
 ## Table of Contents
 
 - [System Requirements](#system-requirements)
+  - [Developing on Windows (WSL)](#developing-on-windows-wsl)
 - [Install Rust (via asdf)](#install-rust-via-asdf)
 - [Install NATS Server](#install-nats-server)
 - [OS Tuning](#os-tuning)
 - [Clone and Build](#clone-and-build)
 - [Running the Server](#running-the-server)
-- [Configuration Reference](#configuration-reference)
+- [Configuration and HTTP API](configuration.md)
 - [Development Tools](#development-tools)
 - [Verifying the Setup](#verifying-the-setup)
+- [Docker and release binaries](#docker-and-release-binaries)
 - [Related Documentation](#related-documentation)
 
 ---
@@ -23,9 +25,22 @@ locally.
 ## System Requirements
 
 - **OS**: macOS (Apple Silicon or Intel) or Linux (x86_64 / ARM64)
-- **Rust**: stable 1.88+
+- **Rust**: stable, minimum version in `Cargo.toml` (`rust-version`, currently 1.88+)
 - **NATS Server**: 2.10+ with JetStream enabled
 - **asdf**: version manager (recommended for Rust toolchain)
+
+### Developing on Windows (WSL)
+
+Rust for this project is expected to run **inside WSL** (Ubuntu), not as a native
+Windows toolchain. From PowerShell or CMD, use:
+
+```bash
+wsl bash -ic "cd /mnt/c/Users/<you>/Git/turbocable-server && cargo build"
+```
+
+Replace the path with your clone location under `/mnt/c/...`. The interactive
+login shell ensures **asdf** shims are on `PATH`. Contributor automation notes:
+[AGENTS.md](../AGENTS.md).
 
 ---
 
@@ -210,36 +225,11 @@ TURBOCABLE_PORT=8080 cargo run
 
 ---
 
-## Configuration Reference
+## Configuration
 
-All options can be set via environment variables or CLI arguments.
-
-| Environment Variable | CLI Argument | Default | Description |
-|---------------------|--------------|---------|-------------|
-| `TURBOCABLE_PORT` | `--port` | `9292` | HTTP/WebSocket listen port |
-| `TURBOCABLE_NATS_URL` | `--nats-url` | `nats://localhost:4222` | NATS server connection URL |
-| `TURBOCABLE_NODE_ID` | `--node-id` | `node_<uuid>` | Unique node identifier (auto-generated if not set) |
-| `TURBOCABLE_PING_INTERVAL` | `--ping-interval-secs` | `30` | WebSocket ping interval in seconds |
-| `TURBOCABLE_MAX_CONN_PER_IP` | `--max-connections-per-ip` | `10` | Maximum concurrent connections per IP address |
-| `TURBOCABLE_JWT_PUBLIC_KEY_PATH` | `--jwt-public-key-path` | _(none)_ | Path to RSA public key PEM file for JWT verification |
-| `TURBOCABLE_MAX_ACK_PENDING` | `--max-ack-pending` | `10000` | Max unacknowledged NATS JetStream messages (back-pressure) |
-| `TURBOCABLE_NATS_STREAM_REPLICAS` | `--nats-stream-replicas` | `1` | JetStream stream replica count (use 3 in production) |
-| `RUST_LOG` | — | `info` | Log level filter (`error`, `warn`, `info`, `debug`, `trace`) |
-
-### Example: full configuration
-
-```bash
-TURBOCABLE_PORT=9292 \
-TURBOCABLE_NATS_URL=nats://localhost:4222 \
-TURBOCABLE_NODE_ID=gateway-01 \
-TURBOCABLE_PING_INTERVAL=30 \
-TURBOCABLE_MAX_CONN_PER_IP=10 \
-TURBOCABLE_JWT_PUBLIC_KEY_PATH=/etc/turbocable/public_key.pem \
-TURBOCABLE_MAX_ACK_PENDING=10000 \
-TURBOCABLE_NATS_STREAM_REPLICAS=1 \
-RUST_LOG=info \
-cargo run --release
-```
+All CLI flags and environment variables, HTTP routes (`/health`, `/metrics`,
+`/pubkey`, `/cable`), and a full example environment block are documented in
+[configuration.md](configuration.md).
 
 ---
 
@@ -413,32 +403,23 @@ See [NATS JetStream Integration](nats-jetstream.md) for full details.
 
 ---
 
-## Running via Docker
+## Docker and release binaries
 
-Pre-built multi-platform images (linux/amd64 and linux/arm64) are published to
-the GitHub Container Registry on every release:
-
-```bash
-docker pull ghcr.io/turbocable/server:latest
-docker run -p 9292:9292 \
-  -e TURBOCABLE_NATS_URL=nats://host.docker.internal:4222 \
-  ghcr.io/turbocable/server:latest
-```
-
-Build locally from source (produces a fully static ~12 MB image):
-
-```bash
-docker build -t turbocable-server .
-```
-
-See [binary-distribution.md](binary-distribution.md) for the full release pipeline and cross-compilation details.
+Pre-built container images and static binaries are documented in
+[binary-distribution.md](binary-distribution.md) (pull commands, `docker build`,
+GitHub Releases, cross-compilation).
 
 ---
 
 ## Related Documentation
 
+- [Configuration and HTTP API](configuration.md) — flags, env vars, endpoints
+- [WebSocket protocol](websocket-protocol.md) — subscribe, replay, JWT claims
+- [Development](development.md) — CI, coding standards, source layout, WSL notes
+- [Load testing and 1M connections](load-testing-1m.md) — phased validation, infra compose files
 - [Architecture Overview](architecture.md) — system design, data flow, and capacity planning
 - [JWT Authentication](jwt-authentication.md) — token format, key rotation, and auth testing
 - [NATS JetStream Integration](nats-jetstream.md) — fan-out pipeline, replay, and NATS configuration
 - [Graceful Shutdown](graceful-shutdown.md) — SIGTERM handling, drain testing, Kubernetes configuration
-- [Binary Distribution](binary-distribution.md) — cross-compilation targets, Docker image, release pipeline
+- [Binary Distribution](binary-distribution.md) — Docker image, release pipeline, cross-compilation
+- [1M connections plan](1m_connections_plan.md) — roadmap, SLOs, deep-dive on replay and durability

@@ -1,0 +1,78 @@
+# TurboCable — observability stack
+#
+# Brings up Prometheus + Alertmanager + Grafana pointed at the gateway cluster.
+#
+# Usage (run alongside the cluster stack):
+#   docker compose -f infra/docker-compose.nats.yml \
+#                  -f infra/docker-compose.cluster.yml \
+#                  -f infra/docker-compose.monitoring.yml up -d
+#
+# Dashboards:
+#   Grafana:      http://localhost:3000  (admin / admin — change on first login)
+#   Prometheus:   http://localhost:9090
+#   Alertmanager: http://localhost:9093
+#
+# Before deploying to production, fill in the placeholder values in
+# infra/alertmanager/alertmanager.yml (PagerDuty key, Slack webhook URL).
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alertmanager/turbocable.rules.yml:/etc/prometheus/rules/turbocable.rules.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"     # allows POST /-/reload to hot-reload config
+    networks:
+      - gateway
+      - monitoring
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin   # change before production use
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/turbocable_dashboard.json:/etc/grafana/provisioning/dashboards/turbocable.json:ro
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - monitoring
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
+
+networks:
+  gateway:
+    external: true
+    name: infra_gateway        # created by docker-compose.cluster.yml
+  monitoring:
+    driver: bridge

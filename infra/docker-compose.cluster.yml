@@ -1,0 +1,119 @@
+# TurboCable — full 3-node cluster stack
+#
+# Brings up:
+#   • 3-node NATS JetStream cluster    (from docker-compose.nats.yml)
+#   • 3 turbocable-server gateway nodes
+#   • nginx WebSocket load balancer
+#
+# Usage (plain HTTP, for local/staging — no SSL termination):
+#   docker compose -f infra/docker-compose.nats.yml \
+#                  -f infra/docker-compose.cluster.yml up -d
+#
+# For production (SSL), run nginx separately using infra/nginx.conf and
+# point it at the three gateway containers.
+#
+# Environment variables (override via .env or shell):
+#   TURBOCABLE_IMAGE     Docker image tag   (default: turbocable-server:latest)
+#   TURBOCABLE_JWT_KEY   Path to RSA public key PEM (optional)
+#   NATS_REPLICAS        JetStream replicas  (default: 3)
+
+services:
+  # ── Gateway node 1 ────────────────────────────────────────────────────────────
+  gw1:
+    image: ${TURBOCABLE_IMAGE:-turbocable-server:latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile.prebuilt
+    environment:
+      TURBOCABLE_PORT:               "9292"
+      TURBOCABLE_NODE_ID:            "gw1"
+      TURBOCABLE_NATS_URL:           "nats://nats1:4222,nats://nats2:4222,nats://nats3:4222"
+      TURBOCABLE_NATS_STREAM_REPLICAS: "${NATS_REPLICAS:-3}"
+      TURBOCABLE_MAX_CONN_PER_IP:    "400000"
+      RUST_LOG:                      "info"
+    ports:
+      - "9292:9292"   # direct access for debugging; normally only nginx talks to gateways
+    networks:
+      - nats-cluster
+      - gateway
+    restart: unless-stopped
+    depends_on:
+      - nats1
+    # No healthcheck: gateway image is FROM scratch (no shell/curl).
+    # nginx detects unhealthy backends via max_fails / fail_timeout in nginx-local.conf.
+
+  # ── Gateway node 2 ────────────────────────────────────────────────────────────
+  gw2:
+    image: ${TURBOCABLE_IMAGE:-turbocable-server:latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile.prebuilt
+    environment:
+      TURBOCABLE_PORT:               "9292"
+      TURBOCABLE_NODE_ID:            "gw2"
+      TURBOCABLE_NATS_URL:           "nats://nats1:4222,nats://nats2:4222,nats://nats3:4222"
+      TURBOCABLE_NATS_STREAM_REPLICAS: "${NATS_REPLICAS:-3}"
+      TURBOCABLE_MAX_CONN_PER_IP:    "400000"
+      RUST_LOG:                      "info"
+    ports:
+      - "9293:9292"
+    networks:
+      - nats-cluster
+      - gateway
+    restart: unless-stopped
+    depends_on:
+      - nats1
+
+  # ── Gateway node 3 ────────────────────────────────────────────────────────────
+  gw3:
+    image: ${TURBOCABLE_IMAGE:-turbocable-server:latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile.prebuilt
+    environment:
+      TURBOCABLE_PORT:               "9292"
+      TURBOCABLE_NODE_ID:            "gw3"
+      TURBOCABLE_NATS_URL:           "nats://nats1:4222,nats://nats2:4222,nats://nats3:4222"
+      TURBOCABLE_NATS_STREAM_REPLICAS: "${NATS_REPLICAS:-3}"
+      TURBOCABLE_MAX_CONN_PER_IP:    "400000"
+      RUST_LOG:                      "info"
+    ports:
+      - "9294:9292"
+    networks:
+      - nats-cluster
+      - gateway
+    restart: unless-stopped
+    depends_on:
+      - nats1
+
+  # ── nginx load balancer ───────────────────────────────────────────────────────
+  #
+  # Serves plain HTTP on port 80 (no SSL) for local/staging.
+  # For production SSL, replace this block with an external nginx using
+  # infra/nginx.conf (which includes SSL termination).
+
+  lb:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx-local.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - gateway
+    restart: unless-stopped
+    depends_on:
+      - gw1
+      - gw2
+      - gw3
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  nats-cluster:
+    external: true        # created by docker-compose.nats.yml
+    name: infra_nats-cluster
+  gateway:
+    driver: bridge

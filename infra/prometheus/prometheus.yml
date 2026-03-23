@@ -1,0 +1,55 @@
+# TurboCable — Prometheus scrape configuration
+#
+# Used by infra/docker-compose.monitoring.yml.
+# Scrapes all 3 gateway nodes and the NATS monitoring endpoint.
+#
+# For a bare-metal / VM deployment, copy this file and replace the
+# static_configs targets with your actual gateway IPs.
+
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: turbocable
+
+rule_files:
+  - /etc/prometheus/rules/turbocable.rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # ── TurboCable gateway nodes ─────────────────────────────────────────────────
+  - job_name: turbocable
+    static_configs:
+      - targets:
+          - gw1:9292
+          - gw2:9292
+          - gw3:9292
+    metrics_path: /metrics
+    relabel_configs:
+      # Use the target host as the instance label for alert annotations.
+      - source_labels: [__address__]
+        target_label: instance
+        regex: "([^:]+).*"
+        replacement: "$1"
+
+  # ── NATS monitoring ──────────────────────────────────────────────────────────
+  #
+  # Requires the nats-exporter or NATS Prometheus exporter sidecar.
+  # The built-in NATS /varz endpoint is JSON, not Prometheus format.
+  # If not using an exporter, remove this job.
+  - job_name: nats
+    static_configs:
+      - targets:
+          - nats1:7777
+          - nats2:7777
+          - nats3:7777
+    metrics_path: /metrics
+
+  # ── Prometheus self-monitoring ───────────────────────────────────────────────
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -57,7 +57,7 @@ services:
       GF_USERS_ALLOW_SIGN_UP:     "false"
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./grafana/turbocable_dashboard.json:/etc/grafana/provisioning/dashboards/turbocable.json:ro
+      - ./grafana/turbocable_dashboard.json:/var/lib/grafana/dashboards/turbocable.json:ro
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     networks:
       - monitoring
@@ -72,7 +72,6 @@ volumes:
 
 networks:
   gateway:
-    external: true
-    name: infra_gateway        # created by docker-compose.cluster.yml
+    driver: bridge             # shared with docker-compose.cluster.yml when run together
   monitoring:
     driver: bridge

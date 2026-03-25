@@ -113,7 +113,6 @@ services:
 
 networks:
   nats-cluster:
-    external: true        # created by docker-compose.nats.yml
-    name: infra_nats-cluster
+    driver: bridge        # shared with docker-compose.nats.yml when run together
   gateway:
     driver: bridge

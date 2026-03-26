@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_cluster.sh — Phase 10.2 three-node cluster test.
+# run_cluster.sh — multi-agent cluster load test (k6 + optional tc-publish).
 #
 # Target: 1M connections total, p99 < 50 ms, zero message loss.
 # Run this script simultaneously on 10 separate k6 agent machines,
@@ -36,7 +36,7 @@ K6_SCRIPT="$PROJECT_ROOT/bench/k6/load_1m.js"
 PUBLISH_BIN="$PROJECT_ROOT/target/release/tc-publish"
 
 echo "================================================================"
-echo "  TurboCable Phase 10.2 — 3-Node Cluster Test"
+echo "  TurboCable — cluster load test"
 echo "  Agent:    $AGENT_ID   (publisher: $IS_PUBLISHER)"
 echo "  Target:   $TARGET connections (total across all agents: 10×$TARGET)"
 echo "  Gateway:  $GATEWAY_WSS_URL"

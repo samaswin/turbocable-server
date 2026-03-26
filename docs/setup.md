@@ -74,8 +74,7 @@ rustup default stable
 
 ## Install NATS Server
 
-NATS with JetStream is required for the key watcher (Phase 5+) and message
-fan-out (Phase 6+).
+NATS with JetStream is required for the key watcher, message fan-out, and related features described in [nats-jetstream.md](nats-jetstream.md).
 
 ### macOS
 
@@ -416,7 +415,7 @@ GitHub Releases, cross-compilation).
 - [Configuration and HTTP API](configuration.md) — flags, env vars, endpoints
 - [WebSocket protocol](websocket-protocol.md) — subscribe, replay, JWT claims
 - [Development](development.md) — CI, coding standards, source layout, WSL notes
-- [Load testing and 1M connections](load-testing-1m.md) — phased validation, infra compose files
+- [Load testing and 1M connections](load-testing-1m.md) — k6 scripts, infra compose files, tuning
 - [Architecture Overview](architecture.md) — system design, data flow, and capacity planning
 - [JWT Authentication](jwt-authentication.md) — token format, key rotation, and auth testing
 - [NATS JetStream Integration](nats-jetstream.md) — fan-out pipeline, replay, and NATS configuration

@@ -99,4 +99,4 @@ src/
 
 - [setup.md](setup.md) — install, verify setup, NATS smoke tests
 - [load-testing-1m.md](load-testing-1m.md) — benchmarks and k6
-- [bench/README.md](../bench/README.md) — load-test scripts and phases
+- [bench/README.md](../bench/README.md) — pointer to load-testing doc and results

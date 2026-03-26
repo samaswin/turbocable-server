@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-GATEWAY_URL="${GATEWAY_URL:-http://localhost:9292}"
+GATEWAY_URL="${GATEWAY_URL:-http://127.0.0.1:9292}"
 POLL_INTERVAL="${POLL_INTERVAL:-15}"  # seconds
 
 PID="${PID:-$(pgrep -x turbocable-server 2>/dev/null | head -1)}"

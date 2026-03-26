@@ -83,9 +83,9 @@ curl http://localhost:9292/health
 | [docs/configuration.md](docs/configuration.md) | CLI/env configuration and HTTP endpoints (`/health`, `/metrics`, `/cable`, …) |
 | [docs/websocket-protocol.md](docs/websocket-protocol.md) | Subscribe, message, replay, JWT claims, close codes |
 | [docs/architecture.md](docs/architecture.md) | System design, data flow, capacity planning |
-| [docs/load-testing-1m.md](docs/load-testing-1m.md) | **How to test toward 1M connections** — phases, compose stacks, links to k6 scripts |
+| [docs/load-testing-1m.md](docs/load-testing-1m.md) | **Load testing** — 333k/1M targets, scripts, k6, `tc-publish`, tuning, Prometheus |
 | [docs/1m_connections_plan.md](docs/1m_connections_plan.md) | Roadmap, SLO summary, reconnect/crash semantics, file index |
-| [bench/README.md](bench/README.md) | k6 scripts, `run_single_node.sh` / `run_cluster.sh`, env vars |
+| [bench/README.md](bench/README.md) | Pointer to `docs/load-testing-1m.md` and `bench/results/` |
 | [docs/development.md](docs/development.md) | Tests, Clippy, fmt, CI jobs, source tree, WSL workflow |
 | [docs/jwt-authentication.md](docs/jwt-authentication.md) | JWT auth and stream authorization |
 | [docs/nats-jetstream.md](docs/nats-jetstream.md) | JetStream fan-out, replay, operations |
@@ -112,7 +112,7 @@ TARGET=333000 GATEWAY_WSS_URL=ws://localhost:9292/cable bash bench/scripts/run_s
 cargo bench --bench registry_bench
 ```
 
-Use [docs/load-testing-1m.md](docs/load-testing-1m.md) for the full phased plan (smoke → 333k → 1M cluster) and [bench/README.md](bench/README.md) for script details.
+Use [docs/load-testing-1m.md](docs/load-testing-1m.md) for the full guide (smoke → 333k → cluster) and script reference.
 
 ## Related packages
 

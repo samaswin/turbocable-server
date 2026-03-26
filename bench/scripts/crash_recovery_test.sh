@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# crash_recovery_test.sh — Phase 3 crash-recovery test.
+# crash_recovery_test.sh — crash-recovery test (SIGKILL gateway, verify delivery).
 #
 # Validates zero data loss across a hard gateway crash (SIGKILL).
 #
@@ -133,7 +133,7 @@ trap cleanup EXIT
 
 _APPROX_AT=$(( KILL_AFTER_S * PUBLISH_RATE ))
 echo "================================================================"
-echo "  TurboCable Phase 3 — Crash Recovery Test"
+echo "  TurboCable — crash recovery test"
 echo "  Messages:   $N_MESSAGES at $PUBLISH_RATE msg/s"
 echo "  Kill after: ${KILL_AFTER_S}s  (≈ ${_APPROX_AT} messages published)"
 echo "  Consumer:   $CONSUMER_NAME  on stream TURBOCABLE"

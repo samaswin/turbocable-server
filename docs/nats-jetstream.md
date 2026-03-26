@@ -1,4 +1,4 @@
-# NATS JetStream Integration (Phase 6)
+# NATS JetStream integration
 
 This document covers the NATS JetStream integration in turbocable-server —
 the core message delivery pipeline that connects backend broadcasts to
@@ -387,14 +387,14 @@ Key types:
 
 ---
 
-## Phase 6 Checklist
+## Integration checklist
 
 - [x] NATS stream created on startup if not exists
 - [x] Consumer reconnects automatically on NATS failure
 - [x] Message replay delivers correct messages in order after reconnect
 - [x] `max_ack_pending` set to prevent NATS overwhelming slow gateway
-- [x] Consumer lag logged periodically (Prometheus gauge in Phase 7)
+- [x] Consumer lag logged periodically (Prometheus gauge)
 - [x] Dual-codec fanout (JSON + MessagePack) without per-connection encoding
 - [x] Client messages published to NATS JetStream
 - [x] Graceful degradation when NATS is unavailable
-- [ ] Fanout latency measured: p99 < 20ms at 1k subscribers (Phase 10 load test)
+- [ ] Fanout latency measured: p99 < 20ms at 1k subscribers (see [load-testing-1m.md](load-testing-1m.md))

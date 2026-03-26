@@ -23,3 +23,6 @@ public.pem
 
 # Agents
 .claude
+
+# k6 raw summary exports (optional; metrics are copied into bench/results/benchmark_metrics.md)
+bench/results/artifacts/*.json

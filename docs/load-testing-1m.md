@@ -1,8 +1,8 @@
 # Load testing and the 1M connection target
 
 This guide explains how to validate **333k connections per node** and **1M
-connections on a three-node cluster**, what infrastructure to use, and where
-the detailed scripts and roadmap live.
+connections on a three-node cluster**, what infrastructure to use, and how to use
+the scripts under `bench/`.
 
 ---
 
@@ -14,26 +14,53 @@ the detailed scripts and roadmap live.
 | Three gateways | ~1M total | Load balancer + shared NATS JetStream cluster |
 
 Success criteria include connection count, fan-out latency (p99), zero sequence
-gaps in k6, and healthy NATS consumer lag. Exact thresholds are summarized in
-[1m_connections_plan.md](1m_connections_plan.md) and in [`bench/README.md`](../bench/README.md).
+gaps in k6, and healthy NATS consumer lag. A roadmap-style summary lives in
+[1m_connections_plan.md](1m_connections_plan.md).
 
 ---
 
 ## Prerequisites
 
 1. **Linux on gateway and k6 agents** — Real counts above ~65k file descriptors
-   are unreliable on default OS settings and impractical in WSL for full-scale
-   runs. Use bare metal or VMs for Phase 4/5.
+   are unreliable on default OS settings and impractical in WSL for **full-scale**
+   333k/1M runs. Use bare metal or VMs for those targets.
 2. **OS tuning** — On every gateway and every k6 machine:
 
    ```bash
    sudo bash bench/scripts/tune_os.sh
    ```
 
+   Raises file-descriptor limits to 2M and sets `net.core.somaxconn=65535`.
+
 3. **Raise per-IP limits on the gateway** — Default `TURBOCABLE_MAX_CONN_PER_IP`
-   is `10`. Load tests from one IP require a much higher limit (see
-   [`bench/README.md`](../bench/README.md)).
-4. **k6** — WebSocket load generator (install steps in `bench/README.md`).
+   is `10`. Load tests from one IP require a much higher limit:
+
+   ```bash
+   # Smoke / moderate load
+   RUST_LOG=info ./target/release/turbocable-server --port 9292 --max-connections-per-ip 5000
+
+   # Large single-host load (e.g. 333k from localhost)
+   RUST_LOG=info ./target/release/turbocable-server --port 9292 --max-connections-per-ip 400000
+
+   # Or via environment variable
+   TURBOCABLE_MAX_CONN_PER_IP=400000 ./target/release/turbocable-server --port 9292
+   ```
+
+   Without this, the gateway rejects connections after the first 10 from the same IP
+   and the k6 `tc_connect_success` rate collapses.
+
+4. **k6** — WebSocket load generator. The apt keyserver method is unreliable on some systems; prefer the direct binary:
+
+   ```bash
+   curl -L https://github.com/grafana/k6/releases/download/v0.55.0/k6-v0.55.0-linux-amd64.tar.gz \
+     -o /tmp/k6.tar.gz && \
+   tar -xzf /tmp/k6.tar.gz -C /tmp && \
+   sudo mv /tmp/k6-v0.55.0-linux-amd64/k6 /usr/local/bin/k6 && \
+   k6 version
+   ```
+
+   Alternatively, the [k6 apt repo](https://k6.io/docs/getting-started/installation/) (may fail if the keyserver is unreachable).
+
 5. **`tc-publish`** — NATS publisher for fan-out tests:
 
    ```bash
@@ -62,19 +89,87 @@ gaps in k6, and healthy NATS consumer lag. Exact thresholds are summarized in
 
 ---
 
-## Phased test flow
+## Directory layout
 
-Work through these in order; do not skip straight to 1M on untuned hardware.
+```
+bench/
+├── k6/
+│   ├── load_1m.js           Main k6 WebSocket load test (single-node + cluster agents)
+│   └── reconnect_test.js    Reconnect + replay validation
+└── scripts/
+    ├── run_full_test_plan.sh   Health → reconnect → crash recovery → sustained load (WSL-friendly defaults)
+    ├── run_single_node.sh      Single-node k6 + tc-publish wrapper
+    ├── run_cluster.sh          Cluster test runner (one process per k6 agent)
+    ├── crash_recovery_test.sh  SIGKILL gateway + restart, verify zero data loss
+    ├── memory_profile.sh       RSS / per-connection memory monitor
+    └── tune_os.sh              One-time OS tuning (fd limits, somaxconn)
 
-| Phase | Goal | Where it is documented |
-|-------|------|-------------------------|
-| **Smoke** | ~1k connections, paths work | Below; [`bench/README.md`](../bench/README.md) |
-| **Reconnect** | Replay after disconnect, zero gaps | `bench/k6/reconnect_test.js`, `bench/README.md` |
+benches/
+└── registry_bench.rs        Criterion micro-benchmarks (in-process fan-out)
+
+src/bin/
+└── publish.rs               tc-publish — NATS message publisher for fan-out testing
+
+infra/
+├── docker-compose.nats.yml     3-node NATS JetStream cluster (replicas=3, FileStorage)
+├── docker-compose.cluster.yml  Full stack: 3 gateways + nginx lb (needs nats compose)
+├── nginx.conf                  Production nginx — SSL termination, least_conn WS LB
+├── nginx-local.conf            Plain HTTP nginx — used by docker-compose.cluster.yml
+├── nats/
+│   ├── nats1.conf              NATS node n1 config
+│   ├── nats2.conf              NATS node n2 config
+│   └── nats3.conf              NATS node n3 config
+├── alertmanager/
+│   ├── turbocable.rules.yml    Prometheus alerting rules (lag, drop, latency)
+│   └── alertmanager.yml        Alertmanager routing (PagerDuty + Slack template)
+├── docker-compose.monitoring.yml  Prometheus + Alertmanager + Grafana stack
+├── prometheus/
+│   └── prometheus.yml          Scrape config for all 3 gateways + NATS
+└── grafana/
+    ├── turbocable_dashboard.json   Grafana dashboard (connections, latency, consumer lag)
+    └── provisioning/
+        ├── datasources/prometheus.yml
+        └── dashboards/dashboards.yml
+```
+
+---
+
+## Recommended test order
+
+Work through these in order; do not jump straight to 1M on untuned hardware.
+
+| Step | Goal | Where |
+|------|------|--------|
+| **Smoke** | ~1k connections, paths work | Below; `run_single_node.sh` |
+| **Reconnect** | Replay after disconnect, zero gaps | `bench/k6/reconnect_test.js` |
 | **Crash recovery** | SIGKILL gateway, no lost fan-out | `bench/scripts/crash_recovery_test.sh` |
 | **Single node** | ~333k connections, p99 latency budget | `bench/scripts/run_single_node.sh` |
 | **Cluster** | ~1M connections via LB + 3 gateways | `bench/scripts/run_cluster.sh` |
 
-### Smoke test (local)
+---
+
+## Automated full plan (WSL / Linux)
+
+From the repo root, `run_full_test_plan.sh` runs in order: health check → reconnect/replay (k6) → crash recovery → sustained load (`run_single_node.sh`). Defaults are safe for **WSL** (1k connections, short ramp/sustain); use `--quick` for a faster smoke.
+
+**Requires:** `cargo`, `k6`, `curl`, `python3`; `nats-server` (or NATS already on `4222`); **`nats` CLI** for crash recovery (or `--skip-crash`). With `--quick`, if the `nats` CLI is missing, crash recovery is skipped automatically.
+
+```bash
+bash bench/scripts/run_full_test_plan.sh               # full WSL-friendly run
+bash bench/scripts/run_full_test_plan.sh --quick       # shorter; skips crash if `nats` CLI missing
+bash bench/scripts/run_full_test_plan.sh --skip-crash  # no `nats` CLI
+bash bench/scripts/run_full_test_plan.sh --target 2000 # override load VUs
+bash bench/scripts/run_full_test_plan.sh --no-build    # use existing release binaries
+NO_BUILD=1 bash bench/scripts/run_full_test_plan.sh
+```
+
+See `bash bench/scripts/run_full_test_plan.sh --help` for all flags (`--with-bench` runs Criterion after load).
+
+**Metrics log:** After successful k6 steps, results append to [`bench/results/benchmark_metrics.md`](../bench/results/benchmark_metrics.md) (UTC date, approximate **send** volume from `tc-publish` rate×duration, **receive** counts and fan-out latency from k6). Override path with `BENCH_METRICS_MD`. Raw k6 JSON is under `bench/results/artifacts/` (see `.gitignore`).
+
+---
+
+## Smoke test (local)
 
 ```bash
 # Terminal 1 — NATS
@@ -90,25 +185,207 @@ curl http://localhost:9292/health
 TARGET=1000 bash bench/scripts/run_single_node.sh
 ```
 
-### Single-node baseline (~333k)
+---
+
+## Single-node baseline (~333k)
+
+**Target:** 333k connections, p99 < 30 ms, < 8 KB/connection (see [1m_connections_plan.md](1m_connections_plan.md) for SLO context).
 
 ```bash
-sudo bash bench/scripts/tune_os.sh
-ulimit -n 1000000
-cargo build --release
-# Start NATS and gateway with appropriate --max-connections-per-ip
+# Quick smoke (1000 connections)
+TARGET=1000 bash bench/scripts/run_single_node.sh
 
-TARGET=333000 \
-GATEWAY_WSS_URL=ws://<gateway-host>:9292/cable \
-bash bench/scripts/run_single_node.sh
+# Full single-node baseline
+TARGET=333000 GATEWAY_WSS_URL=ws://node1:9292/cable bash bench/scripts/run_single_node.sh
 ```
 
-### Cluster (~1M)
+Or run k6 directly:
+
+```bash
+k6 run bench/k6/load_1m.js \
+  -e TARGET=333000 \
+  -e GATEWAY_WSS_URL=ws://node1:9292/cable
+```
+
+### Memory profiling
+
+While the load test runs, monitor RSS on the gateway host:
+
+```bash
+bash bench/scripts/memory_profile.sh
+```
+
+Example output:
+
+```
+Timestamp                 conns    rss(kB)    per(kB)
+-----------------------------------------------------------
+2024-01-15 12:00:00       333142   2548736      7.6
+```
+
+---
+
+## Reconnect and replay validation
+
+**Target:** 100 VUs reconnect after a 5 s gap with zero sequence gaps.
+
+```bash
+# Terminal 1 — NATS
+nats-server --jetstream
+
+# Terminal 2 — Gateway (raise per-IP limit so all VUs can connect from localhost)
+RUST_LOG=info ./target/release/turbocable-server --port 9292 --max-connections-per-ip 200
+
+# Terminal 3 — tc-publish (must be running before k6 starts)
+./target/release/tc-publish --stream bench --rate 1 --duration 120
+
+# Terminal 4 — Reconnect test
+k6 run bench/k6/reconnect_test.js
+```
+
+Custom parameters:
+
+```bash
+k6 run bench/k6/reconnect_test.js \
+  -e TARGET=100 \
+  -e GATEWAY_WSS_URL=ws://localhost:9292/cable \
+  -e PHASE1_DURATION_S=30 \
+  -e RECONNECT_GAP_S=5 \
+  -e PHASE2_DURATION_S=60
+```
+
+**What it tests:**
+
+- Each VU connects and subscribes, recording the last JetStream sequence seen.
+- After 30 s all VUs disconnect simultaneously.
+- After a 5 s offline gap, each VU reconnects and sends
+  `{"type":"hello","last_seq":"N"}` followed by a re-subscribe.
+- The server replays missed messages (`replayed: true`) before confirming the
+  subscription; live messages then resume.
+- `tc_sequence_gaps` must remain `0` — any gap means a message was never
+  delivered even after replay.
+
+**Pass criteria:**
+
+```
+tc_sequence_gaps count     == 0    (no message loss after replay)
+tc_connect_success rate    > 0.99
+tc_reconnect_success rate  > 0.99
+tc_connection_errors count < 10
+```
+
+**Custom metrics:**
+
+| Metric | Description |
+|--------|-------------|
+| `tc_fanout_latency_ms` | p50/p95/p99 latency for live (non-replayed) messages |
+| `tc_messages_received` | Total messages received (initial + replay + live) |
+| `tc_replayed_messages` | Messages delivered with `replayed=true` after reconnect |
+| `tc_sequence_gaps` | Missing seqs not covered by replay (must be 0) |
+| `tc_connect_success` | Rate of successful initial WS upgrades |
+| `tc_reconnect_success` | Rate of successful reconnect WS upgrades |
+| `tc_connection_errors` | Total connection errors across both segments |
+
+---
+
+## Crash recovery test
+
+**Target:** Zero data loss across a hard SIGKILL of the gateway mid-stream.
+
+```bash
+# Terminal 1 — NATS
+nats-server --jetstream
+
+# Terminal 2 — Run the crash recovery test (uses fixed node_id internally)
+bash bench/scripts/crash_recovery_test.sh
+```
+
+Custom parameters:
+
+```bash
+N_MESSAGES=200 PUBLISH_RATE=5 bash bench/scripts/crash_recovery_test.sh
+```
+
+**What it tests:**
+
+- Starts the gateway with a fixed `--node-id` (`crash-test-node` by default) so
+  the durable consumer name is known: `gw_crash-test-node`.
+- Publishes `N_MESSAGES` messages at `PUBLISH_RATE` msg/s via tc-publish.
+- After `KILL_AFTER_S` seconds (≈ half the messages), sends SIGKILL to the gateway.
+- Restarts the gateway with the **same** node-id so it finds the existing durable
+  consumer and resumes from the last ACK position.
+- Waits up to `WAIT_TIMEOUT_S` seconds for `nats consumer info` to report
+  `num_pending = 0`.
+
+**Pass criterion:**
+
+```
+num_pending == 0   after gateway restarts
+```
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NATS_URL` | `nats://localhost:4222` | NATS server URL |
+| `GATEWAY_PORT` | `9292` | Gateway HTTP/WS port |
+| `STREAM` | `bench` | JetStream stream name |
+| `NODE_ID` | `crash-test-node` | Fixed gateway node-id (determines consumer name) |
+| `N_MESSAGES` | `100` | Total messages to publish |
+| `PUBLISH_RATE` | `2` | Messages per second |
+| `KILL_AFTER_S` | `N/rate/2` | Seconds before SIGKILL |
+| `WAIT_TIMEOUT_S` | `60` | Max seconds to wait for `num_pending=0` |
+
+---
+
+## Cluster load (~1M)
+
+**Target:** 1M connections, p99 < 50 ms, zero message loss.
+
+Run `run_cluster.sh` **simultaneously** on 10 separate k6 agent machines, each targeting 100k connections. Designate exactly one agent as the publisher:
+
+```bash
+# Agent 1 (publisher)
+IS_PUBLISHER=true \
+TARGET=100000 \
+GATEWAY_WSS_URL=wss://lb.example.com/cable \
+NATS_URL=nats://nats1.example.com:4222 \
+bash bench/scripts/run_cluster.sh
+
+# Agents 2–10 (no publisher flag)
+TARGET=100000 \
+GATEWAY_WSS_URL=wss://lb.example.com/cable \
+bash bench/scripts/run_cluster.sh
+```
 
 Use the NATS cluster compose file, deploy three gateway instances (or
 `docker-compose.cluster.yml`), point a load balancer at them (see
-`infra/nginx.conf` / `infra/nginx-local.conf`), then run multiple k6 agents with
-`bench/scripts/run_cluster.sh` as described in [`bench/README.md`](../bench/README.md).
+`infra/nginx.conf` / `infra/nginx-local.conf`).
+
+---
+
+## tc-publish — message publisher
+
+The `tc-publish` binary publishes messages with monotonic sequence numbers and
+millisecond timestamps to `TURBOCABLE.<stream>`. k6 clients use these to
+measure end-to-end fan-out latency and detect message loss.
+
+```bash
+# 10 msg/s for 10 minutes
+./target/release/tc-publish --stream bench --rate 10 --duration 600
+
+# 100 msg/s for 5 minutes
+./target/release/tc-publish --stream bench --rate 100 --duration 300
+
+# All options
+./target/release/tc-publish --help
+```
+
+Message format (JSON):
+
+```json
+{"seq": 42, "sent_at": 1700000000123, "stream": "bench"}
+```
 
 ---
 
@@ -120,13 +397,63 @@ In-process registry fan-out benchmarks:
 cargo bench --bench registry_bench
 ```
 
+Benchmarks cover:
+
+- `fanout_json` — all-JSON clients at 1k / 10k / 100k connections
+- `fanout_mixed_codecs` — 50 % JSON + 50 % MessagePack at 1k / 10k / 100k
+- `fanout_backpressure` — drop path when all channel buffers are full
+- `subscribe_deregister` — register + subscribe (3 streams) + deregister × 1000
+
+Results are saved to `target/criterion/` with an HTML report.
+
+---
+
+## Performance tuning under load
+
+If p99 targets are missed, check in this order:
+
+```bash
+# 1. Verify jemalloc is linked
+nm target/release/turbocable-server | grep -i jemalloc
+
+# 2. Check FD limit inside the running process
+cat /proc/$(pgrep turbocable-server)/limits | grep "open files"
+
+# 3. somaxconn
+sysctl net.core.somaxconn
+
+# 4. Reduce channel capacity if memory is over budget
+#    Edit CHANNEL_CAPACITY in src/connection/handler.rs (currently 16)
+
+# 5. DashMap shard count — try 128 for high contention
+#    See src/connection/registry.rs Registry::new()
+
+# 6. NATS max_ack_pending
+#    --max-ack-pending flag or TURBOCABLE_MAX_ACK_PENDING env var
+```
+
+---
+
+## Prometheus metrics
+
+| Metric | Description |
+|--------|-------------|
+| `turbocable_connections_active` | Current open WebSocket connections |
+| `turbocable_connections_total` | Total connections since startup |
+| `turbocable_connections_rejected_total` | Auth / rate-limit rejections |
+| `turbocable_messages_fanned_out_total` | Messages delivered to clients |
+| `turbocable_messages_dropped_total` | Messages dropped (slow clients) |
+| `turbocable_fanout_duration_seconds` | Fan-out latency histogram |
+| `turbocable_nats_consumer_lag` | NATS pending message backlog |
+
+Scrape endpoint: `http://<gateway>:9292/metrics`
+
 ---
 
 ## Further reading
 
 | Document | Contents |
 |----------|----------|
-| [`bench/README.md`](../bench/README.md) | Script reference, env vars, Phase 10.1 / 10.2 details |
 | [1m_connections_plan.md](1m_connections_plan.md) | Roadmap, SLO summary, reconnect/crash semantics, file index |
 | [architecture.md](architecture.md) | Capacity planning and system design |
 | [configuration.md](configuration.md) | Flags/env vars relevant under load |

@@ -211,7 +211,14 @@ else
 fi
 
 if [[ "$SKIP_CRASH" -eq 0 ]]; then
-    nats server ping --server "$NATS_URL" &>/dev/null || die "Cannot reach NATS at $NATS_URL"
+    # Crash recovery needs JetStream + nats CLI; `server ping` often fails on otherwise-working servers.
+    if ! js_check_out=$(nats stream ls --server "$NATS_URL" 2>&1); then
+        printf '[%s] ERROR: NATS JetStream not usable at %s (required for crash recovery).\n' "$(date '+%H:%M:%S')" "$NATS_URL" >&2
+        printf '%s\n' "$js_check_out" >&2
+        printf '%s\n' '' "Typical fixes: nats-server --jetstream; set NATS_URL for TLS (tls://...) or auth (nats://user:pass@...); or --skip-crash." >&2
+        exit 1
+    fi
+    log "NATS JetStream reachable at $NATS_URL"
 fi
 
 start_gateway() {

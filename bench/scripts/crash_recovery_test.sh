@@ -70,8 +70,8 @@ check_prereqs() {
     if ! command -v nats &>/dev/null; then
         fail "nats CLI not found. Install from https://github.com/nats-io/natscli/releases"
     fi
-    if ! nats server ping --server "$NATS_URL" &>/dev/null; then
-        fail "NATS not reachable at $NATS_URL. Start it with: nats-server --jetstream"
+    if ! js_out=$(nats stream ls --server "$NATS_URL" 2>&1); then
+        fail "NATS JetStream not usable at $NATS_URL (nats stream ls failed). Start with: nats-server --jetstream. Output: ${js_out}"
     fi
     if ! command -v python3 &>/dev/null; then
         fail "python3 not found — required to parse nats consumer JSON output"

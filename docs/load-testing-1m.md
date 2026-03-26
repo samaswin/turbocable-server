@@ -154,6 +154,8 @@ From the repo root, `run_full_test_plan.sh` runs in order: health check → reco
 
 **Requires:** `cargo`, `k6`, `curl`, `python3`; `nats-server` (or NATS already on `4222`); **`nats` CLI** for crash recovery (or `--skip-crash`). With `--quick`, if the `nats` CLI is missing, crash recovery is skipped automatically.
 
+**NATS / JetStream:** Before crash recovery, the script runs `nats stream ls` against `NATS_URL` (default `nats://127.0.0.1:4222`). If you see “port 4222 open” but the check still fails, NATS is often running **without** JetStream — restart with `nats-server --jetstream`. For Docker, TLS, or auth, set `NATS_URL` (for example `tls://…` or `nats://user:pass@host:4222`). To ignore this step, use `--skip-crash`.
+
 ```bash
 bash bench/scripts/run_full_test_plan.sh               # full WSL-friendly run
 bash bench/scripts/run_full_test_plan.sh --quick       # shorter; skips crash if `nats` CLI missing

@@ -54,6 +54,7 @@ pub async fn run(cfg: Config) {
         metrics,
         shutdown_rx,
         ws_channel_capacity: cfg.ws_channel_capacity,
+        replay_enforcement: cfg.replay_enforcement,
     };
 
     let app = Router::new()

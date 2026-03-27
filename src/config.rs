@@ -2,6 +2,35 @@
 
 use clap::Parser;
 
+/// Replay enforcement phase.
+///
+/// Loaded from the `REPLAY_ENFORCEMENT` environment variable (default: `compat`).
+/// Advance through phases as replay-capable client coverage grows and each
+/// numeric promotion gate is verified.
+///
+/// Fast rollback: set `REPLAY_ENFORCEMENT=compat` and restart — no code change needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum ReplayEnforcement {
+    /// Accept legacy clients without a hello; emit warnings and metrics for
+    /// subscribe-before-hello connections.
+    #[default]
+    Compat,
+    /// Reject subscribe commands from clients that have not sent a valid hello.
+    SoftEnforce,
+    /// Full enforcement — same behaviour as `soft_enforce` (promoted when Phase C
+    /// numeric gates pass for two consecutive benchmark runs).
+    HardEnforce,
+}
+
+impl ReplayEnforcement {
+    /// Returns `true` when the enforcement mode rejects non-compliant clients
+    /// (i.e. anything stricter than `Compat`).
+    pub fn is_enforcing(self) -> bool {
+        matches!(self, Self::SoftEnforce | Self::HardEnforce)
+    }
+}
+
 /// Server configuration parsed from CLI arguments and environment variables.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "turbocable-server", version, about)]
@@ -49,6 +78,18 @@ pub struct Config {
     /// Use 1 for local dev (single NATS node) and 3 for production clusters.
     #[arg(long, env = "TURBOCABLE_NATS_STREAM_REPLICAS", default_value = "1")]
     pub nats_stream_replicas: usize,
+
+    /// Replay enforcement phase.
+    ///
+    /// Controls how the gateway handles clients that send subscribe commands before
+    /// the required hello handshake:
+    /// - `compat` (default): allow with a warning metric — safe during rollout.
+    /// - `soft_enforce`: reject subscribe; client must send hello first.
+    /// - `hard_enforce`: same as soft_enforce; use after Phase C promotion gates pass.
+    ///
+    /// Fast rollback: set `REPLAY_ENFORCEMENT=compat` and restart.
+    #[arg(long, env = "REPLAY_ENFORCEMENT", default_value = "compat")]
+    pub replay_enforcement: ReplayEnforcement,
 }
 
 /// Generates a random node ID prefixed with `node_`.

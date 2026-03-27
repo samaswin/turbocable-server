@@ -7,14 +7,14 @@ pub mod types;
 use bytes::Bytes;
 
 use crate::errors::GatewayError;
-use types::{ClientCommand, ServerMessage};
+use types::{ClientFrame, ServerMessage};
 
 /// Wire-format codec selected during WebSocket sub-protocol negotiation.
 ///
 /// Implementations: [`json::JsonCodec`] (actioncable-v1-json) and
 /// [`msgpack::MsgpackCodec`] (turbocable-v1-msgpack).
 pub trait Codec: Send + Sync {
-    fn decode(&self, data: &[u8]) -> Result<ClientCommand, GatewayError>;
+    fn decode(&self, data: &[u8]) -> Result<ClientFrame, GatewayError>;
     fn encode(&self, msg: &ServerMessage) -> Result<Bytes, GatewayError>;
 }
 
@@ -54,12 +54,12 @@ mod tests {
     fn json_codec_via_trait_object() {
         let codec = codec_for_protocol(SUB_PROTOCOL_JSON).unwrap();
         let input = br#"{"command":"subscribe","identifier":"ch_1"}"#;
-        let cmd = codec.decode(input).unwrap();
+        let frame = codec.decode(input).unwrap();
         assert_eq!(
-            cmd,
-            types::ClientCommand::Subscribe {
+            frame,
+            types::ClientFrame::Command(types::ClientCommand::Subscribe {
                 identifier: "ch_1".into()
-            }
+            })
         );
 
         let msg = types::ServerMessage::Welcome;
@@ -68,11 +68,25 @@ mod tests {
     }
 
     #[test]
+    fn json_codec_hello_frame() {
+        let codec = codec_for_protocol(SUB_PROTOCOL_JSON).unwrap();
+        let input = br#"{"type":"hello","last_seq":42,"capabilities":["replay_v1"]}"#;
+        let frame = codec.decode(input).unwrap();
+        match frame {
+            types::ClientFrame::Hello(hello) => {
+                assert_eq!(hello.last_seq, Some(42));
+                assert!(hello.is_replay_capable());
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn msgpack_codec_via_trait_object() {
         let codec = codec_for_protocol(SUB_PROTOCOL_MSGPACK).unwrap();
-        let original = types::ClientCommand::Subscribe {
+        let original = types::ClientFrame::Command(types::ClientCommand::Subscribe {
             identifier: "ch_2".into(),
-        };
+        });
         let packed = rmp_serde::to_vec_named(&original).unwrap();
         let decoded = codec.decode(&packed).unwrap();
         assert_eq!(original, decoded);

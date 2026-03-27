@@ -3,16 +3,16 @@
 use bytes::Bytes;
 
 use crate::errors::GatewayError;
-use crate::protocol::types::{ClientCommand, ServerMessage};
+use crate::protocol::types::{ClientFrame, ServerMessage};
 use crate::protocol::Codec;
 
 /// JSON codec implementing the `actioncable-v1-json` sub-protocol.
 pub struct JsonCodec;
 
 impl Codec for JsonCodec {
-    fn decode(&self, data: &[u8]) -> Result<ClientCommand, GatewayError> {
+    fn decode(&self, data: &[u8]) -> Result<ClientFrame, GatewayError> {
         serde_json::from_slice(data)
-            .map_err(|e| GatewayError::Protocol(format!("invalid JSON command: {e}")))
+            .map_err(|e| GatewayError::Protocol(format!("invalid JSON frame: {e}")))
     }
 
     fn encode(&self, msg: &ServerMessage) -> Result<Bytes, GatewayError> {
@@ -25,49 +25,99 @@ impl Codec for JsonCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::types::{ClientCommand, HelloCommand, HelloTag};
     use serde_json::json;
 
     fn codec() -> JsonCodec {
         JsonCodec
     }
 
-    // --- Decode ClientCommand ---
+    // --- Decode ClientFrame::Command ---
 
     #[test]
     fn decode_subscribe() {
         let input = br#"{"command":"subscribe","identifier":"{\"channel\":\"ChatChannel\",\"room_id\":1}"}"#;
-        let cmd = codec().decode(input).unwrap();
+        let frame = codec().decode(input).unwrap();
         assert_eq!(
-            cmd,
-            ClientCommand::Subscribe {
+            frame,
+            ClientFrame::Command(ClientCommand::Subscribe {
                 identifier: r#"{"channel":"ChatChannel","room_id":1}"#.into(),
-            }
+            })
         );
     }
 
     #[test]
     fn decode_unsubscribe() {
         let input = br#"{"command":"unsubscribe","identifier":"test_channel"}"#;
-        let cmd = codec().decode(input).unwrap();
+        let frame = codec().decode(input).unwrap();
         assert_eq!(
-            cmd,
-            ClientCommand::Unsubscribe {
+            frame,
+            ClientFrame::Command(ClientCommand::Unsubscribe {
                 identifier: "test_channel".into(),
-            }
+            })
         );
     }
 
     #[test]
     fn decode_message() {
         let input = br#"{"command":"message","identifier":"chat_1","data":"{\"action\":\"speak\",\"text\":\"hello\"}"}"#;
-        let cmd = codec().decode(input).unwrap();
+        let frame = codec().decode(input).unwrap();
         assert_eq!(
-            cmd,
-            ClientCommand::Message {
+            frame,
+            ClientFrame::Command(ClientCommand::Message {
                 identifier: "chat_1".into(),
                 data: r#"{"action":"speak","text":"hello"}"#.into(),
-            }
+            })
         );
+    }
+
+    // --- Decode ClientFrame::Hello ---
+
+    #[test]
+    fn decode_hello_fresh_connection() {
+        let input = br#"{"type":"hello"}"#;
+        let frame = codec().decode(input).unwrap();
+        assert_eq!(
+            frame,
+            ClientFrame::Hello(HelloCommand {
+                hello_type: HelloTag::Hello,
+                last_seq: None,
+                capabilities: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn decode_hello_with_last_seq() {
+        let input = br#"{"type":"hello","last_seq":99}"#;
+        let frame = codec().decode(input).unwrap();
+        match frame {
+            ClientFrame::Hello(h) => assert_eq!(h.last_seq, Some(99)),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_hello_replay_capable() {
+        let input = br#"{"type":"hello","last_seq":7,"capabilities":["replay_v1"]}"#;
+        let frame = codec().decode(input).unwrap();
+        match frame {
+            ClientFrame::Hello(h) => {
+                assert_eq!(h.last_seq, Some(7));
+                assert!(h.is_replay_capable());
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_hello_without_replay_capability() {
+        let input = br#"{"type":"hello"}"#;
+        let frame = codec().decode(input).unwrap();
+        match frame {
+            ClientFrame::Hello(h) => assert!(!h.is_replay_capable()),
+            other => panic!("expected Hello, got {other:?}"),
+        }
     }
 
     // --- Encode ServerMessage ---
@@ -240,11 +290,23 @@ mod tests {
 
     #[test]
     fn json_round_trip_subscribe() {
-        let original = ClientCommand::Subscribe {
+        let original = ClientFrame::Command(ClientCommand::Subscribe {
             identifier: "room_99".into(),
-        };
+        });
         let encoded = serde_json::to_vec(&original).unwrap();
-        let decoded: ClientCommand = serde_json::from_slice(&encoded).unwrap();
+        let decoded: ClientFrame = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn json_round_trip_hello() {
+        let original = ClientFrame::Hello(HelloCommand {
+            hello_type: HelloTag::Hello,
+            last_seq: Some(123),
+            capabilities: vec!["replay_v1".into()],
+        });
+        let encoded = serde_json::to_vec(&original).unwrap();
+        let decoded: ClientFrame = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(original, decoded);
     }
 

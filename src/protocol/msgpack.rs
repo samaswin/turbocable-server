@@ -3,16 +3,16 @@
 use bytes::Bytes;
 
 use crate::errors::GatewayError;
-use crate::protocol::types::{ClientCommand, ServerMessage};
+use crate::protocol::types::{ClientFrame, ServerMessage};
 use crate::protocol::Codec;
 
 /// MessagePack codec implementing the `turbocable-v1-msgpack` sub-protocol.
 pub struct MsgpackCodec;
 
 impl Codec for MsgpackCodec {
-    fn decode(&self, data: &[u8]) -> Result<ClientCommand, GatewayError> {
+    fn decode(&self, data: &[u8]) -> Result<ClientFrame, GatewayError> {
         rmp_serde::from_slice(data)
-            .map_err(|e| GatewayError::Protocol(format!("invalid msgpack command: {e}")))
+            .map_err(|e| GatewayError::Protocol(format!("invalid msgpack frame: {e}")))
     }
 
     fn encode(&self, msg: &ServerMessage) -> Result<Bytes, GatewayError> {
@@ -25,42 +25,69 @@ impl Codec for MsgpackCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::types::{ClientCommand, HelloCommand, HelloTag};
     use serde_json::json;
 
     fn codec() -> MsgpackCodec {
         MsgpackCodec
     }
 
-    // --- Round-trip ClientCommand ---
+    // --- Round-trip ClientFrame::Command ---
 
     #[test]
     fn round_trip_subscribe() {
-        let original = ClientCommand::Subscribe {
+        let original = ClientFrame::Command(ClientCommand::Subscribe {
             identifier: r#"{"channel":"ChatChannel","room_id":1}"#.into(),
-        };
+        });
         let encoded = rmp_serde::to_vec_named(&original).unwrap();
-        let decoded: ClientCommand = rmp_serde::from_slice(&encoded).unwrap();
+        let decoded: ClientFrame = rmp_serde::from_slice(&encoded).unwrap();
         assert_eq!(original, decoded);
     }
 
     #[test]
     fn round_trip_unsubscribe() {
-        let original = ClientCommand::Unsubscribe {
+        let original = ClientFrame::Command(ClientCommand::Unsubscribe {
             identifier: "notifications".into(),
-        };
+        });
         let encoded = rmp_serde::to_vec_named(&original).unwrap();
-        let decoded: ClientCommand = rmp_serde::from_slice(&encoded).unwrap();
+        let decoded: ClientFrame = rmp_serde::from_slice(&encoded).unwrap();
         assert_eq!(original, decoded);
     }
 
     #[test]
     fn round_trip_message() {
-        let original = ClientCommand::Message {
+        let original = ClientFrame::Command(ClientCommand::Message {
             identifier: "chat_42".into(),
             data: r#"{"action":"speak","text":"hi"}"#.into(),
-        };
+        });
         let encoded = rmp_serde::to_vec_named(&original).unwrap();
-        let decoded: ClientCommand = rmp_serde::from_slice(&encoded).unwrap();
+        let decoded: ClientFrame = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    // --- Round-trip ClientFrame::Hello ---
+
+    #[test]
+    fn round_trip_hello_fresh() {
+        let original = ClientFrame::Hello(HelloCommand {
+            hello_type: HelloTag::Hello,
+            last_seq: None,
+            capabilities: vec![],
+        });
+        let encoded = rmp_serde::to_vec_named(&original).unwrap();
+        let decoded: ClientFrame = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn round_trip_hello_replay_capable() {
+        let original = ClientFrame::Hello(HelloCommand {
+            hello_type: HelloTag::Hello,
+            last_seq: Some(555),
+            capabilities: vec!["replay_v1".into()],
+        });
+        let encoded = rmp_serde::to_vec_named(&original).unwrap();
+        let decoded: ClientFrame = rmp_serde::from_slice(&encoded).unwrap();
         assert_eq!(original, decoded);
     }
 
@@ -153,9 +180,9 @@ mod tests {
     #[test]
     fn codec_trait_round_trip_subscribe() {
         let c = codec();
-        let original = ClientCommand::Subscribe {
+        let original = ClientFrame::Command(ClientCommand::Subscribe {
             identifier: "room_5".into(),
-        };
+        });
         let encoded = rmp_serde::to_vec_named(&original).unwrap();
         let decoded = c.decode(&encoded).unwrap();
         assert_eq!(original, decoded);
@@ -164,10 +191,10 @@ mod tests {
     #[test]
     fn codec_trait_round_trip_message() {
         let c = codec();
-        let original = ClientCommand::Message {
+        let original = ClientFrame::Command(ClientCommand::Message {
             identifier: "chat_99".into(),
             data: "payload".into(),
-        };
+        });
         let encoded = rmp_serde::to_vec_named(&original).unwrap();
         let decoded = c.decode(&encoded).unwrap();
         assert_eq!(original, decoded);

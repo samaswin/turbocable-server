@@ -14,11 +14,12 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
 
 use crate::auth::jwt::{self, JwtVerifier};
+use crate::config::ReplayEnforcement;
 use crate::connection::limiter::ConnectionLimiter;
 use crate::connection::registry::Registry;
 use crate::metrics::Metrics;
 use crate::presence::{HeartbeatHandle, PresenceManager};
-use crate::protocol::types::{ClientCommand, ServerMessage};
+use crate::protocol::types::{ClientCommand, ClientFrame, ServerMessage};
 use crate::protocol::{self, Codec, SUB_PROTOCOL_JSON, SUB_PROTOCOL_MSGPACK};
 use crate::pubsub::nats::NatsConsumer;
 
@@ -27,6 +28,21 @@ const WS_CLOSE_AUTH_FAILED: u16 = 3000;
 
 /// WebSocket close code sent when the server is shutting down (RFC 6455 §7.4.1).
 const WS_CLOSE_GOING_AWAY: u16 = 1001;
+
+/// Per-connection handshake state machine.
+///
+/// Every connection starts in [`ConnectionState::AwaitingHello`].  The gateway
+/// transitions to [`ConnectionState::Active`] on receipt of a valid hello frame.
+/// In `Compat` enforcement mode a subscribe-before-hello also transitions to
+/// `Active` (with a warning metric); in stricter modes the command is rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionState {
+    /// Waiting for the client's hello frame.  Only hello frames are fully
+    /// processed in this state; other commands are handled per enforcement mode.
+    AwaitingHello,
+    /// Handshake complete — all frame types are processed normally.
+    Active,
+}
 
 /// Shared application state passed to every Axum handler.
 #[derive(Clone)]
@@ -49,6 +65,8 @@ pub struct AppState {
     pub shutdown_rx: watch::Receiver<bool>,
     /// Per-connection outbound mpsc channel capacity.
     pub ws_channel_capacity: usize,
+    /// Replay enforcement phase — controls how subscribe-before-hello is handled.
+    pub replay_enforcement: ReplayEnforcement,
 }
 
 /// Query parameters extracted from the WebSocket upgrade URL.
@@ -59,21 +77,10 @@ pub struct WsQueryParams {
     pub token: Option<String>,
 }
 
-/// Client-sent hello message for reconnection with replay.
-/// Distinct from [`ClientCommand`] — uses `"type"` tag instead of `"command"`.
-#[derive(Debug, serde::Deserialize)]
-struct HelloMessage {
-    #[serde(rename = "type")]
-    msg_type: String,
-    /// Last JetStream stream sequence the client received before disconnecting.
-    last_seq: Option<String>,
-}
-
 /// Per-connection context bundling the fields that are fixed for the lifetime of one connection.
 struct ConnContext<'a> {
     conn_id: u64,
     codec: &'a dyn Codec,
-    is_binary: bool,
     tx: &'a mpsc::Sender<Bytes>,
     allowed_streams: &'a [String],
     user_id: Option<&'a str>,
@@ -211,7 +218,6 @@ async fn handle_socket(
     let ctx = ConnContext {
         conn_id,
         codec: &*codec,
-        is_binary,
         tx: &tx,
         allowed_streams: &allowed_streams,
         user_id: user_id.as_deref(),
@@ -297,7 +303,12 @@ async fn inbound_loop(
     let mut ping_interval = tokio::time::interval(Duration::from_secs(state.ping_interval_secs));
     ping_interval.tick().await;
 
-    // Stores the last_seq from a client "hello" message for reconnection replay.
+    // Per-connection handshake state.  Starts in AwaitingHello; transitions to
+    // Active on receipt of a valid hello frame (or immediately in Compat mode
+    // when a subscribe arrives first).
+    let mut conn_state = ConnectionState::AwaitingHello;
+
+    // Stores the last_seq from the client hello for reconnection replay.
     // Set once per connection, consumed during subsequent subscribe commands.
     let mut last_seq: Option<u64> = None;
 
@@ -312,12 +323,14 @@ async fn inbound_loop(
                 match msg {
                     Some(Ok(Message::Text(ref text))) => {
                         handle_client_frame(
-                            text.as_bytes(), &ctx, state, &mut last_seq, &mut heartbeats,
+                            text.as_bytes(), &ctx, state,
+                            &mut conn_state, &mut last_seq, &mut heartbeats,
                         ).await;
                     }
                     Some(Ok(Message::Binary(ref data))) => {
                         handle_client_frame(
-                            data, &ctx, state, &mut last_seq, &mut heartbeats,
+                            data, &ctx, state,
+                            &mut conn_state, &mut last_seq, &mut heartbeats,
                         ).await;
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
@@ -359,105 +372,168 @@ async fn handle_client_frame(
     data: &[u8],
     ctx: &ConnContext<'_>,
     state: &AppState,
+    conn_state: &mut ConnectionState,
     last_seq: &mut Option<u64>,
     heartbeats: &mut std::collections::HashMap<String, HeartbeatHandle>,
 ) {
-    match ctx.codec.decode(data) {
-        Ok(cmd) => {
-            tracing::debug!(ctx.conn_id, ?cmd, "received command");
-            match cmd {
-                ClientCommand::Subscribe { identifier } => {
-                    if !jwt::is_allowed(ctx.allowed_streams, &identifier) {
-                        tracing::warn!(
-                            ctx.conn_id,
-                            identifier,
-                            "subscribe rejected: stream not allowed"
-                        );
-                        if let Ok(reject) = ctx
-                            .codec
-                            .encode(&ServerMessage::RejectSubscription { identifier })
-                        {
-                            let _ = ctx.tx.send(reject).await;
-                        }
-                        return;
-                    }
+    let frame = match ctx.codec.decode(data) {
+        Ok(f) => f,
+        Err(_) => {
+            tracing::warn!(ctx.conn_id, "failed to decode client frame");
+            return;
+        }
+    };
 
-                    let stream_key = stream_key_from_identifier(&identifier);
-                    state.registry.subscribe(ctx.conn_id, stream_key);
+    match frame {
+        ClientFrame::Hello(hello) => {
+            *last_seq = hello.last_seq;
+            *conn_state = ConnectionState::Active;
 
-                    // Write presence entry and start heartbeat (if presence is configured).
-                    if let (Some(uid), Some(presence)) = (ctx.user_id, state.presence.as_ref()) {
-                        presence.put(&identifier, uid).await;
-                        let handle = presence.start_heartbeat(identifier.clone(), uid.to_string());
-                        heartbeats.insert(identifier.clone(), handle);
-                        tracing::debug!(
-                            ctx.conn_id,
-                            stream = identifier,
-                            user_id = uid,
-                            "presence written"
-                        );
-                    }
-
-                    // Replay missed messages when client reconnected with last_seq.
-                    // Happens before confirm so the client receives replayed messages first.
-                    if let Some(seq) = *last_seq {
-                        replay_for_stream(&identifier, seq, ctx.conn_id, ctx.codec, ctx.tx, state)
-                            .await;
-                    }
-
-                    if let Ok(confirm) = ctx
-                        .codec
-                        .encode(&ServerMessage::ConfirmSubscription { identifier })
-                    {
-                        let _ = ctx.tx.send(confirm).await;
-                    }
-                }
-                ClientCommand::Unsubscribe { identifier } => {
-                    let stream_key = stream_key_from_identifier(&identifier);
-                    state.registry.unsubscribe(ctx.conn_id, stream_key);
-
-                    // Remove heartbeat (aborts task) and delete presence key.
-                    if let (Some(uid), Some(presence)) = (ctx.user_id, state.presence.as_ref()) {
-                        heartbeats.remove(&identifier); // Drop aborts heartbeat task.
-                        presence.delete(&identifier, uid).await;
-                        tracing::debug!(
-                            ctx.conn_id,
-                            stream = identifier,
-                            user_id = uid,
-                            "presence removed"
-                        );
-                    }
-                }
-                ClientCommand::Message {
-                    identifier,
-                    ref data,
-                } => {
-                    if let Some(ref nats) = state.nats_consumer {
-                        let payload = Bytes::copy_from_slice(data.as_bytes());
-                        if let Err(e) = nats.publish(&identifier, payload).await {
-                            tracing::warn!(
-                                ctx.conn_id,
-                                identifier,
-                                error = %e,
-                                "failed to publish client message to NATS"
-                            );
-                        }
-                    } else {
-                        tracing::debug!(
-                            ctx.conn_id,
-                            identifier,
-                            "client message dropped (NATS not available)"
-                        );
-                    }
-                }
+            if hello.is_replay_capable() {
+                state.metrics.handshake_ok_replay_capable_total.inc();
+                tracing::info!(
+                    ctx.conn_id,
+                    last_seq = ?hello.last_seq,
+                    "client hello: replay_v1 capable"
+                );
+            } else {
+                state.metrics.handshake_ok_legacy_total.inc();
+                tracing::info!(
+                    ctx.conn_id,
+                    last_seq = ?hello.last_seq,
+                    "client hello: no replay capability"
+                );
             }
         }
-        Err(_) => {
-            // Not a standard command — try parsing as a "hello" reconnection message.
-            if try_parse_hello(data, ctx.is_binary, ctx.conn_id, last_seq) {
+
+        ClientFrame::Command(cmd) => {
+            // Enforce handshake state before processing commands.
+            if *conn_state == ConnectionState::AwaitingHello {
+                if state.replay_enforcement.is_enforcing() {
+                    // Reject the command — client must send hello first.
+                    state.metrics.handshake_rejected_total.inc();
+                    tracing::warn!(
+                        ctx.conn_id,
+                        ?cmd,
+                        enforcement = ?state.replay_enforcement,
+                        "command rejected: hello required before subscribe"
+                    );
+                    if let ClientCommand::Subscribe { ref identifier } = cmd {
+                        if let Ok(reject) = ctx.codec.encode(&ServerMessage::RejectSubscription {
+                            identifier: identifier.clone(),
+                        }) {
+                            let _ = ctx.tx.send(reject).await;
+                        }
+                    }
+                    return;
+                }
+
+                // Compat mode: allow with a warning metric and transition to Active.
+                state.metrics.handshake_legacy_warn_total.inc();
+                tracing::warn!(
+                    ctx.conn_id,
+                    "subscribe before hello: transitioning to Active in compat mode (legacy client)"
+                );
+                *conn_state = ConnectionState::Active;
+            }
+
+            tracing::debug!(ctx.conn_id, ?cmd, "received command");
+            dispatch_command(cmd, ctx, state, last_seq, heartbeats).await;
+        }
+    }
+}
+
+/// Dispatches a fully validated [`ClientCommand`] after handshake state checks pass.
+async fn dispatch_command(
+    cmd: ClientCommand,
+    ctx: &ConnContext<'_>,
+    state: &AppState,
+    last_seq: &mut Option<u64>,
+    heartbeats: &mut std::collections::HashMap<String, HeartbeatHandle>,
+) {
+    match cmd {
+        ClientCommand::Subscribe { identifier } => {
+            if !jwt::is_allowed(ctx.allowed_streams, &identifier) {
+                tracing::warn!(
+                    ctx.conn_id,
+                    identifier,
+                    "subscribe rejected: stream not allowed"
+                );
+                if let Ok(reject) = ctx
+                    .codec
+                    .encode(&ServerMessage::RejectSubscription { identifier })
+                {
+                    let _ = ctx.tx.send(reject).await;
+                }
                 return;
             }
-            tracing::warn!(ctx.conn_id, "failed to decode client frame");
+
+            let stream_key = stream_key_from_identifier(&identifier);
+            state.registry.subscribe(ctx.conn_id, stream_key);
+
+            // Write presence entry and start heartbeat (if presence is configured).
+            if let (Some(uid), Some(presence)) = (ctx.user_id, state.presence.as_ref()) {
+                presence.put(&identifier, uid).await;
+                let handle = presence.start_heartbeat(identifier.clone(), uid.to_string());
+                heartbeats.insert(identifier.clone(), handle);
+                tracing::debug!(
+                    ctx.conn_id,
+                    stream = identifier,
+                    user_id = uid,
+                    "presence written"
+                );
+            }
+
+            // Replay missed messages when client reconnected with last_seq.
+            // Happens before confirm so the client receives replayed messages first.
+            if let Some(seq) = *last_seq {
+                replay_for_stream(&identifier, seq, ctx.conn_id, ctx.codec, ctx.tx, state).await;
+            }
+
+            if let Ok(confirm) = ctx
+                .codec
+                .encode(&ServerMessage::ConfirmSubscription { identifier })
+            {
+                let _ = ctx.tx.send(confirm).await;
+            }
+        }
+        ClientCommand::Unsubscribe { identifier } => {
+            let stream_key = stream_key_from_identifier(&identifier);
+            state.registry.unsubscribe(ctx.conn_id, stream_key);
+
+            // Remove heartbeat (aborts task) and delete presence key.
+            if let (Some(uid), Some(presence)) = (ctx.user_id, state.presence.as_ref()) {
+                heartbeats.remove(&identifier); // Drop aborts heartbeat task.
+                presence.delete(&identifier, uid).await;
+                tracing::debug!(
+                    ctx.conn_id,
+                    stream = identifier,
+                    user_id = uid,
+                    "presence removed"
+                );
+            }
+        }
+        ClientCommand::Message {
+            identifier,
+            ref data,
+        } => {
+            if let Some(ref nats) = state.nats_consumer {
+                let payload = Bytes::copy_from_slice(data.as_bytes());
+                if let Err(e) = nats.publish(&identifier, payload).await {
+                    tracing::warn!(
+                        ctx.conn_id,
+                        identifier,
+                        error = %e,
+                        "failed to publish client message to NATS"
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    ctx.conn_id,
+                    identifier,
+                    "client message dropped (NATS not available)"
+                );
+            }
         }
     }
 }
@@ -476,33 +552,6 @@ fn stream_key_from_identifier(identifier: &str) -> &str {
         }
     }
     identifier
-}
-
-/// Attempts to parse the frame as a `{"type":"hello","last_seq":"N"}` message.
-/// Returns `true` if successfully parsed, `false` otherwise.
-fn try_parse_hello(data: &[u8], is_binary: bool, conn_id: u64, last_seq: &mut Option<u64>) -> bool {
-    let hello: Option<HelloMessage> = if is_binary {
-        rmp_serde::from_slice(data).ok()
-    } else {
-        serde_json::from_slice(data).ok()
-    };
-
-    if let Some(hello) = hello {
-        if hello.msg_type == "hello" {
-            let seq = hello
-                .last_seq
-                .as_deref()
-                .and_then(|s| s.parse::<u64>().ok());
-            *last_seq = seq;
-            tracing::info!(
-                conn_id,
-                last_seq = ?seq,
-                "client hello received"
-            );
-            return true;
-        }
-    }
-    false
 }
 
 /// Replays missed messages from JetStream for a specific stream after client reconnection.

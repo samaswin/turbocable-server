@@ -19,6 +19,25 @@ gaps in k6, and healthy NATS consumer lag. A roadmap-style summary lives in
 
 ---
 
+## Release / promotion gates (numeric)
+
+Use these thresholds to decide whether a change is safe to promote. These gates mirror `docs/reliability-replay-plan.md` so reliability work doesn’t compromise the 1M+ / sub-50ms promise.
+
+- **Connection scale**: sustain >= 1,000,000 concurrent connections for a 30-minute steady-state window (canonical load environment).
+- **Fan-out latency**: p95 <= 50ms and p99 <= 75ms during steady-state plus reconnect churn scenarios.
+- **Sequence integrity**: `tc_sequence_gaps == 0` and replay ordering violations == 0 in all promotion runs.
+- **Replay reliability**: replay success rate >= 99.95% and replay failure rate <= 0.05% per run.
+- **Backpressure safety**: forced reconnect rate <= 1.0% of active connections per minute over any 5-minute window.
+- **Recovery**: post-reconnect first-delivery p95 <= 2s and full catch-up success >= 99.9% for clients inside retention window.
+
+Phase minimums (if rolling out enforcement):
+
+- **Phase A (compat)**: run at >= 250k sustained; pass all gates except 1M scale; replay-capable client coverage >= 80%.
+- **Phase B (soft enforce)**: run at >= 600k sustained; pass all numeric gates; measure and bound non-compliant client rejects.
+- **Phase C (hard enforce)**: run at full 1M sustained; pass all numeric gates for two consecutive runs; validate rollback switch with a controlled drill.
+
+---
+
 ## Prerequisites
 
 1. **Linux on gateway and k6 agents** — Real counts above ~65k file descriptors

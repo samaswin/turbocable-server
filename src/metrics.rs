@@ -25,6 +25,17 @@ pub struct Metrics {
     pub nats_consumer_lag: GenericGauge<AtomicI64>,
     /// JWT verification latency histogram in seconds.
     pub auth_duration_secs: Histogram,
+
+    // --- Handshake / capability metrics (Phase 1) ---
+    /// Clients that completed a valid hello handshake and advertised `replay_v1`.
+    pub handshake_ok_replay_capable_total: GenericCounter<AtomicU64>,
+    /// Clients that completed a valid hello handshake without `replay_v1` capability.
+    pub handshake_ok_legacy_total: GenericCounter<AtomicU64>,
+    /// Clients that sent a subscribe command before hello in compat mode (warning path).
+    /// A non-zero rate signals legacy clients still in the fleet.
+    pub handshake_legacy_warn_total: GenericCounter<AtomicU64>,
+    /// Commands rejected because the client had not yet sent a valid hello (enforce mode).
+    pub handshake_rejected_total: GenericCounter<AtomicU64>,
 }
 
 impl Metrics {
@@ -86,6 +97,30 @@ impl Metrics {
         ]))
         .expect("metric registration failed");
 
+        let handshake_ok_replay_capable_total = prometheus::register_int_counter!(
+            "turbocable_handshake_ok_replay_capable_total",
+            "Clients that completed hello handshake with replay_v1 capability"
+        )
+        .expect("metric registration failed");
+
+        let handshake_ok_legacy_total = prometheus::register_int_counter!(
+            "turbocable_handshake_ok_legacy_total",
+            "Clients that completed hello handshake without replay_v1 capability"
+        )
+        .expect("metric registration failed");
+
+        let handshake_legacy_warn_total = prometheus::register_int_counter!(
+            "turbocable_handshake_legacy_warn_total",
+            "Subscribe-before-hello connections allowed in compat mode (legacy client signal)"
+        )
+        .expect("metric registration failed");
+
+        let handshake_rejected_total = prometheus::register_int_counter!(
+            "turbocable_handshake_rejected_total",
+            "Commands rejected because client had not sent hello (enforce mode)"
+        )
+        .expect("metric registration failed");
+
         Arc::new(Self {
             connections_active,
             connections_total,
@@ -95,6 +130,10 @@ impl Metrics {
             fanout_duration_secs,
             nats_consumer_lag,
             auth_duration_secs,
+            handshake_ok_replay_capable_total,
+            handshake_ok_legacy_total,
+            handshake_legacy_warn_total,
+            handshake_rejected_total,
         })
     }
 

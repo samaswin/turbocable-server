@@ -38,6 +38,12 @@ pub struct Metrics {
     pub handshake_rejected_total: GenericCounter<AtomicU64>,
     /// Subscribe commands rejected in enforce mode: hello lacked `replay_v1` (or compat subscribe-before-hello).
     pub handshake_rejected_non_replay_capable_total: GenericCounter<AtomicU64>,
+
+    // --- Backpressure eviction metrics (Phase 2) ---
+    /// Connections force-disconnected because their outbound channel was full.
+    /// These clients receive a `disconnect` frame with `reconnect=true` and are
+    /// expected to reconnect and replay from their last sequence.
+    pub forced_reconnect_backpressure_total: GenericCounter<AtomicU64>,
 }
 
 impl Metrics {
@@ -129,6 +135,12 @@ impl Metrics {
         )
         .expect("metric registration failed");
 
+        let forced_reconnect_backpressure_total = prometheus::register_int_counter!(
+            "turbocable_forced_reconnect_backpressure_total",
+            "Connections evicted due to full outbound channel (backpressure reconnect)"
+        )
+        .expect("metric registration failed");
+
         Arc::new(Self {
             connections_active,
             connections_total,
@@ -143,6 +155,7 @@ impl Metrics {
             handshake_legacy_warn_total,
             handshake_rejected_total,
             handshake_rejected_non_replay_capable_total,
+            forced_reconnect_backpressure_total,
         })
     }
 

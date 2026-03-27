@@ -386,14 +386,17 @@ fn process_nats_message(
     if result.sent > 0 {
         metrics.messages_fanned_out.inc_by(result.sent as u64);
     }
-    if result.dropped > 0 {
-        metrics.messages_dropped.inc_by(result.dropped as u64);
+    if !result.evicted.is_empty() {
+        let count = result.evicted.len() as u64;
+        metrics.messages_dropped.inc_by(count);
+        metrics.forced_reconnect_backpressure_total.inc_by(count);
         tracing::debug!(
             stream = stream_name,
             seq = sequence,
             sent = result.sent,
-            dropped = result.dropped,
-            "fan-out completed with slow-client drops"
+            evicted = count,
+            ?result.evicted,
+            "fan-out: slow connections evicted for backpressure reconnect"
         );
     }
 }

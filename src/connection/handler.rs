@@ -195,7 +195,19 @@ async fn handle_socket(
     let is_binary = protocol == SUB_PROTOCOL_MSGPACK;
     let conn_id = state.registry.allocate_id();
     let (tx, rx) = mpsc::channel::<Bytes>(state.ws_channel_capacity);
-    state.registry.register(conn_id, tx.clone(), is_binary);
+    let (evict_tx, evict_rx) = mpsc::channel::<()>(1);
+    state
+        .registry
+        .register(conn_id, tx.clone(), is_binary, evict_tx);
+
+    // Pre-encode the backpressure disconnect frame once so the outbound loop
+    // can send it without access to the codec.
+    let disconnect_frame = codec
+        .encode(&ServerMessage::Disconnect {
+            reason: "backpressure_reconnect_required".to_string(),
+            reconnect: Some(true),
+        })
+        .unwrap_or_default();
 
     state.metrics.connections_total.inc();
     state.metrics.connections_active.inc();
@@ -213,6 +225,8 @@ async fn handle_socket(
         ws_sender,
         is_binary,
         state.shutdown_rx.clone(),
+        evict_rx,
+        disconnect_frame,
     ));
 
     let ctx = ConnContext {
@@ -238,9 +252,22 @@ async fn outbound_loop(
     mut sender: SplitSink<WebSocket, Message>,
     is_binary: bool,
     mut shutdown_rx: watch::Receiver<bool>,
+    mut evict_rx: mpsc::Receiver<()>,
+    disconnect_frame: Bytes,
 ) {
     loop {
         tokio::select! {
+            biased;
+
+            // Eviction takes highest priority: send the disconnect frame and close.
+            _ = evict_rx.recv() => {
+                if let Some(msg) = bytes_to_ws_msg(disconnect_frame.clone(), is_binary) {
+                    let _ = sender.send(msg).await;
+                }
+                let _ = sender.close().await;
+                return;
+            }
+
             payload = rx.recv() => {
                 match payload {
                     Some(payload) => {

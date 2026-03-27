@@ -12,6 +12,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use turbocable_server::connection::registry::Registry;
 
 // Pre-encoded payloads representative of real fan-out messages.
@@ -37,8 +38,9 @@ fn bench_fanout_json(c: &mut Criterion) {
 
                 for _ in 0..n {
                     let (tx, rx) = tokio::sync::mpsc::channel(256);
+                    let (evict_tx, _evict_rx) = mpsc::channel(1);
                     let id = registry.allocate_id();
-                    registry.register(id, tx, false);
+                    registry.register(id, tx, false, evict_tx);
                     registry.subscribe(id, "bench_stream");
                     receivers.push(rx);
                 }
@@ -72,9 +74,10 @@ fn bench_fanout_mixed_codecs(c: &mut Criterion) {
 
                 for i in 0..n {
                     let (tx, rx) = tokio::sync::mpsc::channel(256);
+                    let (evict_tx, _evict_rx) = mpsc::channel(1);
                     let id = registry.allocate_id();
                     // Alternate: even = JSON, odd = MessagePack
-                    registry.register(id, tx, i % 2 == 1);
+                    registry.register(id, tx, i % 2 == 1, evict_tx);
                     registry.subscribe(id, "bench_stream");
                     receivers.push(rx);
                 }
@@ -107,10 +110,11 @@ fn bench_fanout_backpressure(c: &mut Criterion) {
                 let mut receivers = Vec::with_capacity(n);
 
                 for _ in 0..n {
-                    // Capacity 1: fill it immediately, then every subsequent fanout drops.
+                    // Capacity 1: fill it immediately, then the overflow fanout evicts.
                     let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    let (evict_tx, _evict_rx) = mpsc::channel(1);
                     let id = registry.allocate_id();
-                    registry.register(id, tx, false);
+                    registry.register(id, tx, false, evict_tx);
                     registry.subscribe(id, "bench_stream");
                     receivers.push(rx);
                 }
@@ -143,8 +147,9 @@ fn bench_subscribe_deregister(c: &mut Criterion) {
 
             for _ in 0..1_000 {
                 let (tx, _rx) = tokio::sync::mpsc::channel(16);
+                let (evict_tx, _evict_rx) = mpsc::channel(1);
                 let id = registry.allocate_id();
-                registry.register(id, tx, false);
+                registry.register(id, tx, false, evict_tx);
                 registry.subscribe(id, "stream_a");
                 registry.subscribe(id, "stream_b");
                 registry.subscribe(id, "stream_c");

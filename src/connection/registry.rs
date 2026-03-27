@@ -9,6 +9,13 @@ use tokio::sync::mpsc;
 /// Per-connection metadata stored in the registry alongside the outbound sender.
 pub(crate) struct ConnectionEntry {
     pub sender: mpsc::Sender<Bytes>,
+    /// Capacity-1 channel used to signal backpressure eviction.
+    ///
+    /// When the outbound `sender` channel is full, the fanout path sends on this
+    /// channel (non-blocking best-effort) instead of silently dropping the message.
+    /// The `outbound_loop` selects on the receiving end and closes the socket with
+    /// a `disconnect` frame so the client can reconnect and replay.
+    pub evict_tx: mpsc::Sender<()>,
     /// `true` when the connection uses the binary MessagePack codec;
     /// `false` for the default JSON (ActionCable-compatible) codec.
     pub is_binary: bool,
@@ -18,8 +25,16 @@ pub(crate) struct ConnectionEntry {
 pub struct FanoutResult {
     /// Number of subscribers that accepted the message.
     pub sent: usize,
-    /// Number of subscribers whose channel was full (back-pressure).
+    /// Number of subscribers whose channel was full and were evicted.
+    ///
+    /// Each evicted connection received an eviction signal on its `evict_tx` channel
+    /// and was immediately deregistered. The count equals `evicted.len()`.
     pub dropped: usize,
+    /// Connection IDs that were evicted due to a full outbound channel.
+    ///
+    /// Callers can use this list to log per-connection detail and drive
+    /// `forced_reconnect_backpressure_total` metrics without re-scanning the registry.
+    pub evicted: Vec<u64>,
 }
 
 /// Thread-safe connection registry backed by sharded DashMaps.
@@ -66,9 +81,25 @@ impl Registry {
     /// `is_binary` indicates whether the connection uses MessagePack (`true`)
     /// or JSON (`false`) encoding, which determines which pre-encoded payload
     /// is delivered during NATS fan-out.
-    pub fn register(&self, conn_id: u64, sender: mpsc::Sender<Bytes>, is_binary: bool) {
-        self.connections
-            .insert(conn_id, ConnectionEntry { sender, is_binary });
+    ///
+    /// `evict_tx` is a capacity-1 sender used to signal backpressure eviction.
+    /// The handler's `outbound_loop` selects on the paired receiver and closes
+    /// the socket with a `disconnect` frame when the signal arrives.
+    pub fn register(
+        &self,
+        conn_id: u64,
+        sender: mpsc::Sender<Bytes>,
+        is_binary: bool,
+        evict_tx: mpsc::Sender<()>,
+    ) {
+        self.connections.insert(
+            conn_id,
+            ConnectionEntry {
+                sender,
+                evict_tx,
+                is_binary,
+            },
+        );
         self.conn_streams.insert(conn_id, SmallVec::new());
         self.active.fetch_add(1, Ordering::Relaxed);
     }
@@ -123,6 +154,11 @@ impl Registry {
     /// This is the hot path used by the NATS consumer: each message is pre-encoded
     /// once per codec, then routed to the correct connections based on their codec type.
     /// No per-connection encoding happens here — only `Bytes::clone` (one atomic increment).
+    ///
+    /// When a connection's outbound channel is full, this method signals eviction via
+    /// the connection's `evict_tx` channel (non-blocking, best-effort) and deregisters
+    /// the connection immediately.  Evicted connection IDs are returned in
+    /// [`FanoutResult::evicted`] so the caller can drive metrics.
     pub fn fanout_encoded(
         &self,
         stream: &str,
@@ -130,7 +166,7 @@ impl Registry {
         binary_payload: Bytes,
     ) -> FanoutResult {
         let mut sent = 0;
-        let mut dropped = 0;
+        let mut evicted: Vec<u64> = Vec::new();
 
         if let Some(subscribers) = self.streams.get(stream) {
             for &conn_id in subscribers.iter() {
@@ -142,13 +178,28 @@ impl Registry {
                     };
                     match entry.sender.try_send(payload) {
                         Ok(()) => sent += 1,
-                        Err(_) => dropped += 1,
+                        Err(_) => {
+                            // Signal eviction (non-blocking; if signal is already queued
+                            // the channel is full and one signal is sufficient).
+                            let _ = entry.evict_tx.try_send(());
+                            evicted.push(conn_id);
+                        }
                     }
                 }
             }
         }
+        // All DashMap guards are released here before deregistering.
 
-        FanoutResult { sent, dropped }
+        for &conn_id in &evicted {
+            self.deregister(conn_id);
+        }
+
+        let dropped = evicted.len();
+        FanoutResult {
+            sent,
+            dropped,
+            evicted,
+        }
     }
 
     /// Returns the current number of active connections.
@@ -185,6 +236,13 @@ mod tests {
         }
     }
 
+    /// Registers a connection with a throwaway eviction receiver (tests that do not
+    /// need to observe eviction signals).
+    fn reg_add(reg: &Registry, conn_id: u64, sender: mpsc::Sender<Bytes>, is_binary: bool) {
+        let (evict_tx, _evict_rx) = mpsc::channel(1);
+        reg.register(conn_id, sender, is_binary, evict_tx);
+    }
+
     #[tokio::test]
     async fn register_and_fanout_to_1000() {
         let reg = test_registry();
@@ -193,7 +251,7 @@ mod tests {
         for _ in 0..1000 {
             let id = reg.allocate_id();
             let (tx, rx) = mpsc::channel(16);
-            reg.register(id, tx, false);
+            reg_add(&reg, id, tx, false);
             reg.subscribe(id, "chat_room_42");
             receivers.push((id, rx));
         }
@@ -211,32 +269,47 @@ mod tests {
         }
     }
 
+    /// Full outbound channel triggers eviction: the connection receives a signal on
+    /// `evict_rx`, is deregistered from the registry, and subsequent fanouts skip it.
     #[tokio::test]
-    async fn slow_client_does_not_block_fanout() {
+    async fn slow_client_triggers_eviction() {
         let reg = test_registry();
-        let mut receivers = Vec::with_capacity(10);
+        let mut outbound_rxs: Vec<mpsc::Receiver<Bytes>> = Vec::new();
+        let mut evict_rxs: Vec<mpsc::Receiver<()>> = Vec::new();
 
         for _ in 0..10 {
             let id = reg.allocate_id();
             let (tx, rx) = mpsc::channel(1);
-            reg.register(id, tx, false);
+            let (evict_tx, evict_rx) = mpsc::channel(1);
+            reg.register(id, tx, false, evict_tx);
             reg.subscribe(id, "stream_a");
-            receivers.push((id, rx));
+            outbound_rxs.push(rx);
+            evict_rxs.push(evict_rx);
         }
 
-        // Fill every channel so the next fanout will find them full.
-        let filler = Bytes::from_static(b"fill");
-        reg.fanout("stream_a", filler);
+        // Fill every channel so the next fanout will trigger evictions.
+        reg.fanout("stream_a", Bytes::from_static(b"fill"));
 
         let result = reg.fanout("stream_a", Bytes::from_static(b"overflow"));
-        assert_eq!(result.dropped, 10);
         assert_eq!(result.sent, 0);
+        assert_eq!(result.dropped, 10);
+        assert_eq!(result.evicted.len(), 10);
 
-        // Drain one receiver and retry — that client should now succeed.
-        let _ = receivers[0].1.try_recv();
+        // Every eviction channel should have received exactly one signal.
+        for evict_rx in &mut evict_rxs {
+            assert!(evict_rx.try_recv().is_ok(), "expected eviction signal");
+        }
+
+        // All connections were deregistered.
+        assert_eq!(reg.connection_count(), 0);
+
+        // Fanout to stream_a is now a no-op.
         let result = reg.fanout("stream_a", Bytes::from_static(b"retry"));
-        assert_eq!(result.sent, 1);
-        assert_eq!(result.dropped, 9);
+        assert_eq!(result.sent, 0);
+        assert_eq!(result.dropped, 0);
+        assert!(result.evicted.is_empty());
+
+        drop(outbound_rxs);
     }
 
     #[tokio::test]
@@ -244,7 +317,7 @@ mod tests {
         let reg = test_registry();
         let id = reg.allocate_id();
         let (tx, _rx) = mpsc::channel(16);
-        reg.register(id, tx, false);
+        reg_add(&reg, id, tx, false);
 
         reg.subscribe(id, "stream_x");
         reg.subscribe(id, "stream_y");
@@ -277,7 +350,8 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let id = reg.allocate_id();
                 let (tx, rx) = mpsc::channel(16);
-                reg.register(id, tx, false);
+                let (evict_tx, _evict_rx) = mpsc::channel(1);
+                reg.register(id, tx, false, evict_tx);
                 reg.subscribe(id, "shared_stream");
                 (id, rx)
             }));
@@ -320,7 +394,8 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let id = reg.allocate_id();
                 let (tx, _rx) = mpsc::channel(1);
-                reg.register(id, tx, false);
+                let (evict_tx, _evict_rx) = mpsc::channel(1);
+                reg.register(id, tx, false, evict_tx);
                 id
             }));
         }
@@ -351,7 +426,7 @@ mod tests {
         let reg = test_registry();
         let id = reg.allocate_id();
         let (tx, mut rx) = mpsc::channel(16);
-        reg.register(id, tx, false);
+        reg_add(&reg, id, tx, false);
         reg.subscribe(id, "news");
 
         let result = reg.fanout("news", Bytes::from_static(b"msg1"));
@@ -370,7 +445,7 @@ mod tests {
         let reg = test_registry();
         let id = reg.allocate_id();
         let (tx, mut rx) = mpsc::channel(16);
-        reg.register(id, tx, false);
+        reg_add(&reg, id, tx, false);
 
         reg.subscribe(id, "dup_stream");
         reg.subscribe(id, "dup_stream");
@@ -387,7 +462,7 @@ mod tests {
         let reg = test_registry();
         let id = reg.allocate_id();
         let (tx, _rx) = mpsc::channel(16);
-        reg.register(id, tx, false);
+        reg_add(&reg, id, tx, false);
         reg.subscribe(id, "stream_q");
 
         reg.deregister(id);
@@ -413,7 +488,7 @@ mod tests {
         for _ in 0..10_000 {
             let id = reg.allocate_id();
             let (tx, rx) = mpsc::channel(16);
-            reg.register(id, tx, false);
+            reg_add(&reg, id, tx, false);
             reg.subscribe(id, "large_stream");
             receivers.push(rx);
         }
@@ -441,8 +516,8 @@ mod tests {
         let (json_tx, mut json_rx) = mpsc::channel(16);
         let (bin_tx, mut bin_rx) = mpsc::channel(16);
 
-        reg.register(json_id, json_tx, false);
-        reg.register(binary_id, bin_tx, true);
+        reg_add(&reg, json_id, json_tx, false);
+        reg_add(&reg, binary_id, bin_tx, true);
         reg.subscribe(json_id, "mixed");
         reg.subscribe(binary_id, "mixed");
 
@@ -465,7 +540,7 @@ mod tests {
         for _ in 0..5 {
             let id = reg.allocate_id();
             let (tx, rx) = mpsc::channel(16);
-            reg.register(id, tx, false);
+            reg_add(&reg, id, tx, false);
             reg.subscribe(id, "json_only");
             receivers.push(rx);
         }

@@ -41,55 +41,69 @@ wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo fmt --check 2
 
 ## Task Completion Requirement
 
-After completing any task, **all agents must run the format check** and fix any issues before considering the task done:
+Use judgment: **do not** run every check on every tiny task (that wastes time, especially `cargo doc` and `cargo audit`). Run what matches the change.
+
+### After Rust code changes (default)
+
+1. **Format check** — fix if needed:
 
 ```bash
 wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo fmt --all --check 2>&1"
 ```
 
-If the check fails, run `cargo fmt --all` to fix formatting, then re-verify:
+If the check fails:
 
 ```bash
 wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo fmt --all 2>&1"
 ```
 
-Also run `cargo clippy` to catch lint errors and warnings:
+2. **Clippy** — fix reported issues:
 
 ```bash
 wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo clippy --all-targets --all-features -- -D warnings 2>&1"
 ```
 
-If clippy reports errors, fix them before considering the task done.
+3. **Tests** when behavior changed or could regress:
 
-Also run `cargo doc` to ensure documentation builds without errors:
+```bash
+wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo test 2>&1"
+```
+
+Skip clippy/tests only for edits that cannot affect them (e.g. typo in a comment with no code change).
+
+### `cargo doc` — when relevant, not every time
+
+Run **only if** the task adds or changes **rustdoc**, public API surface, or features that affect generated docs:
 
 ```bash
 wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo doc 2>&1"
 ```
 
-Also run `cargo audit` to check for known vulnerabilities in dependencies:
+For a quick check on **this crate only** (faster):
+
+```bash
+wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo doc --no-deps 2>&1"
+```
+
+### `cargo audit` — when dependencies change
+
+Run **only if** `Cargo.toml` / `Cargo.lock` / dependency versions were changed, or the task explicitly concerns security/supply chain:
 
 ```bash
 wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo audit 2>&1"
 ```
 
-If vulnerabilities are found, fix them by updating the affected dependencies:
-
-```bash
-wsl bash -ic "cd /mnt/c/Users/aswin/Git/turbocable-server && cargo update 2>&1"
-```
-
-If `cargo update` does not resolve the vulnerability (e.g. it requires a major version bump), manually update the dependency version in `Cargo.toml` and run `cargo update` again. Re-run `cargo audit` to confirm all vulnerabilities are resolved before considering the task done.
+If vulnerabilities are found, fix by updating affected dependencies (`cargo update`, or edit `Cargo.toml` for major bumps), then re-run `cargo audit` to confirm resolution.
 
 ## Documentation and README Updates
 
-After completing any task, **always check and update documentation** if the task introduced new features, changed behavior, or affected any documented area:
+When a task **changes behavior, config, or public API**, update the docs that cover it. Do not churn README or other `.md` files for unrelated edits.
 
 1. Review `README.md` — update setup steps, feature lists, configuration examples, or usage instructions if affected.
 2. Review any `.md` files in the project root (e.g. `gateway_phases.md`, `AGENTS.md`) — update if the task changes architecture, phases, or agent behavior.
 3. If a new feature or component was added, ensure it is reflected in the relevant docs.
 
-Do **not** skip this step. Documentation should always stay in sync with the code.
+When nothing user-facing changed, skip doc edits.
 
 ## Installation Requirements
 

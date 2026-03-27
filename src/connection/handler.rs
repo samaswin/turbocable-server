@@ -383,7 +383,8 @@ async fn handle_client_frame(
                         return;
                     }
 
-                    state.registry.subscribe(ctx.conn_id, &identifier);
+                    let stream_key = stream_key_from_identifier(&identifier);
+                    state.registry.subscribe(ctx.conn_id, stream_key);
 
                     // Write presence entry and start heartbeat (if presence is configured).
                     if let (Some(uid), Some(presence)) = (ctx.user_id, state.presence.as_ref()) {
@@ -413,7 +414,8 @@ async fn handle_client_frame(
                     }
                 }
                 ClientCommand::Unsubscribe { identifier } => {
-                    state.registry.unsubscribe(ctx.conn_id, &identifier);
+                    let stream_key = stream_key_from_identifier(&identifier);
+                    state.registry.unsubscribe(ctx.conn_id, stream_key);
 
                     // Remove heartbeat (aborts task) and delete presence key.
                     if let (Some(uid), Some(presence)) = (ctx.user_id, state.presence.as_ref()) {
@@ -459,6 +461,22 @@ async fn handle_client_frame(
             tracing::warn!(ctx.conn_id, "failed to decode client frame");
         }
     }
+}
+
+/// Extracts the stream name from an ActionCable identifier.
+///
+/// The identifier is a JSON-encoded string like:
+///   `{"channel":"BenchmarkChannel","stream":"bench"}`
+/// Returns the `"stream"` value when present, otherwise the raw identifier.
+fn stream_key_from_identifier(identifier: &str) -> &str {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(identifier) {
+        if let Some(s) = v.get("stream").and_then(|s| s.as_str()) {
+            if let Some(start) = identifier.find(s) {
+                return &identifier[start..start + s.len()];
+            }
+        }
+    }
+    identifier
 }
 
 /// Attempts to parse the frame as a `{"type":"hello","last_seq":"N"}` message.

@@ -318,7 +318,7 @@ impl NatsConsumer {
             processed += 1;
 
             // Refresh consumer lag gauge every 10k messages.
-            if processed % 10_000 == 0 {
+            if processed.is_multiple_of(10_000) {
                 update_consumer_lag(&mut consumer, metrics).await;
             }
         }

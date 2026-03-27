@@ -149,7 +149,7 @@ export default function () {
 
         default:
           // Fan-out message from tc-publish.
-          if (msg.identifier === identifier && msg.message) {
+          if ((msg.identifier === identifier || msg.identifier === STREAM) && msg.message) {
             tcMessagesReceived.add(1);
 
             // Latency: publisher embeds sent_at (Unix ms); we measure receipt time.

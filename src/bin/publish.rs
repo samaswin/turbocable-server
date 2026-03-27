@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         seq += 1;
 
-        if !args.quiet && seq % 100 == 0 {
+        if !args.quiet && seq.is_multiple_of(100) {
             eprintln!("Published {seq} messages");
         }
     }

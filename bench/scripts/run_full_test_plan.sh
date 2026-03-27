@@ -34,12 +34,12 @@ GATEWAY_PORT="${GATEWAY_PORT:-9292}"
 GATEWAY_HTTP="http://127.0.0.1:${GATEWAY_PORT}"
 GATEWAY_WS="ws://127.0.0.1:${GATEWAY_PORT}/cable"
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
-MAX_CONN_PER_IP="${MAX_CONN_PER_IP:-5000}"
+MAX_CONN_PER_IP="${MAX_CONN_PER_IP:-}"          # computed after --target is parsed
 TARGET_LOAD="${TARGET_LOAD:-1000}"
 RAMP_DURATION="${RAMP_DURATION:-1m}"
-DURATION="${DURATION:-2m}"
+DURATION="${DURATION:-5m}"
 LATENCY_P99_MS="${LATENCY_P99_MS:-50}"
-PUBLISH_RATE="${PUBLISH_RATE:-10}"
+PUBLISH_RATE="${PUBLISH_RATE:-500}"
 
 QUICK=0
 SKIP_CRASH=0
@@ -94,6 +94,9 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Default per-IP limit to TARGET + 10% + 100 so all k6 VUs (same IP) are never rejected.
+MAX_CONN_PER_IP="${MAX_CONN_PER_IP:-$(( TARGET_LOAD + TARGET_LOAD / 10 + 100 ))}"
 
 # k6 summary JSON (reconnect test); timestamp expanded once per run
 K6_RECONNECT_SUMMARY="$PROJECT_ROOT/bench/results/artifacts/k6-reconnect-$(date -u '+%Y%m%d-%H%M%S').json"
@@ -172,6 +175,14 @@ trap cleanup EXIT
 # --- WSL hint (informational) ---
 if [[ -f /proc/version ]] && grep -qi microsoft /proc/version; then
     log "Detected WSL — using WSL-friendly targets (see docs/load-testing-1m.md for bare-metal 333k/1M)."
+fi
+
+# --- OS tuning ---
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    log "Applying OS tuning (tune_os.sh)..."
+    bash "$SCRIPT_DIR/tune_os.sh"
+else
+    log "NOTE: Run 'sudo bash bench/scripts/tune_os.sh' before load testing for best results (skipping — not root)."
 fi
 
 # --- Preflight ---

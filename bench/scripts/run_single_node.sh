@@ -27,7 +27,7 @@ NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
 STREAM="${STREAM:-bench}"
 RAMP_DURATION="${RAMP_DURATION:-2m}"
 DURATION="${DURATION:-10m}"
-PUBLISH_RATE="${PUBLISH_RATE:-10}"   # msg/s during sustained phase
+PUBLISH_RATE="${PUBLISH_RATE:-500}"  # msg/s during sustained phase
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -45,6 +45,14 @@ echo "  Target:   $TARGET connections"
 echo "  Gateway:  $GATEWAY_WSS_URL"
 echo "  Ramp:     $RAMP_DURATION  |  Sustain: $DURATION"
 echo "================================================================"
+
+# --- OS tuning ---
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    echo "--> Applying OS tuning (tune_os.sh)..."
+    bash "$SCRIPT_DIR/tune_os.sh"
+else
+    echo "NOTE: Run 'sudo bash bench/scripts/tune_os.sh' before load testing for best results (skipping — not root)."
+fi
 
 # Verify prerequisites
 if ! command -v k6 &>/dev/null; then

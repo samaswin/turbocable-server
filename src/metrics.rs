@@ -36,6 +36,8 @@ pub struct Metrics {
     pub handshake_legacy_warn_total: GenericCounter<AtomicU64>,
     /// Commands rejected because the client had not yet sent a valid hello (enforce mode).
     pub handshake_rejected_total: GenericCounter<AtomicU64>,
+    /// Subscribe commands rejected in enforce mode: hello lacked `replay_v1` (or compat subscribe-before-hello).
+    pub handshake_rejected_non_replay_capable_total: GenericCounter<AtomicU64>,
 }
 
 impl Metrics {
@@ -121,6 +123,12 @@ impl Metrics {
         )
         .expect("metric registration failed");
 
+        let handshake_rejected_non_replay_capable_total = prometheus::register_int_counter!(
+            "turbocable_handshake_rejected_non_replay_capable_total",
+            "Subscribe rejected in enforce mode: client not replay_v1-capable"
+        )
+        .expect("metric registration failed");
+
         Arc::new(Self {
             connections_active,
             connections_total,
@@ -134,6 +142,7 @@ impl Metrics {
             handshake_ok_legacy_total,
             handshake_legacy_warn_total,
             handshake_rejected_total,
+            handshake_rejected_non_replay_capable_total,
         })
     }
 

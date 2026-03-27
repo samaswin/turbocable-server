@@ -16,10 +16,9 @@ pub enum ReplayEnforcement {
     /// subscribe-before-hello connections.
     #[default]
     Compat,
-    /// Reject subscribe commands from clients that have not sent a valid hello.
+    /// Require hello before commands and `replay_v1` on hello for subscribe.
     SoftEnforce,
-    /// Full enforcement — same behaviour as `soft_enforce` (promoted when Phase C
-    /// numeric gates pass for two consecutive benchmark runs).
+    /// Same behaviour as `soft_enforce` (promoted when Phase C gates pass).
     HardEnforce,
 }
 
@@ -81,11 +80,11 @@ pub struct Config {
 
     /// Replay enforcement phase.
     ///
-    /// Controls how the gateway handles clients that send subscribe commands before
-    /// the required hello handshake:
-    /// - `compat` (default): allow with a warning metric — safe during rollout.
-    /// - `soft_enforce`: reject subscribe; client must send hello first.
-    /// - `hard_enforce`: same as soft_enforce; use after Phase C promotion gates pass.
+    /// Controls hello ordering and `replay_v1` capability:
+    /// - `compat` (default): allow subscribe-before-hello with a warning metric; allow
+    ///   hello without `replay_v1`.
+    /// - `soft_enforce` / `hard_enforce`: reject commands before hello; require
+    ///   `capabilities: ["replay_v1"]` on hello or subscribe is rejected.
     ///
     /// Fast rollback: set `REPLAY_ENFORCEMENT=compat` and restart.
     #[arg(long, env = "REPLAY_ENFORCEMENT", default_value = "compat")]

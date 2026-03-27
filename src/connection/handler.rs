@@ -65,7 +65,7 @@ pub struct AppState {
     pub shutdown_rx: watch::Receiver<bool>,
     /// Per-connection outbound mpsc channel capacity.
     pub ws_channel_capacity: usize,
-    /// Replay enforcement phase — controls how subscribe-before-hello is handled.
+    /// Replay enforcement phase — hello ordering and `replay_v1` requirement.
     pub replay_enforcement: ReplayEnforcement,
 }
 
@@ -308,6 +308,9 @@ async fn inbound_loop(
     // when a subscribe arrives first).
     let mut conn_state = ConnectionState::AwaitingHello;
 
+    // Set from hello `capabilities` (`replay_v1`); stays false for compat subscribe-before-hello.
+    let mut replay_capable = false;
+
     // Stores the last_seq from the client hello for reconnection replay.
     // Set once per connection, consumed during subsequent subscribe commands.
     let mut last_seq: Option<u64> = None;
@@ -324,13 +327,13 @@ async fn inbound_loop(
                     Some(Ok(Message::Text(ref text))) => {
                         handle_client_frame(
                             text.as_bytes(), &ctx, state,
-                            &mut conn_state, &mut last_seq, &mut heartbeats,
+                            &mut conn_state, &mut replay_capable, &mut last_seq, &mut heartbeats,
                         ).await;
                     }
                     Some(Ok(Message::Binary(ref data))) => {
                         handle_client_frame(
                             data, &ctx, state,
-                            &mut conn_state, &mut last_seq, &mut heartbeats,
+                            &mut conn_state, &mut replay_capable, &mut last_seq, &mut heartbeats,
                         ).await;
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
@@ -373,6 +376,7 @@ async fn handle_client_frame(
     ctx: &ConnContext<'_>,
     state: &AppState,
     conn_state: &mut ConnectionState,
+    replay_capable: &mut bool,
     last_seq: &mut Option<u64>,
     heartbeats: &mut std::collections::HashMap<String, HeartbeatHandle>,
 ) {
@@ -387,6 +391,7 @@ async fn handle_client_frame(
     match frame {
         ClientFrame::Hello(hello) => {
             *last_seq = hello.last_seq;
+            *replay_capable = hello.is_replay_capable();
             *conn_state = ConnectionState::Active;
 
             if hello.is_replay_capable() {
@@ -438,7 +443,7 @@ async fn handle_client_frame(
             }
 
             tracing::debug!(ctx.conn_id, ?cmd, "received command");
-            dispatch_command(cmd, ctx, state, last_seq, heartbeats).await;
+            dispatch_command(cmd, ctx, state, last_seq, heartbeats, *replay_capable).await;
         }
     }
 }
@@ -450,9 +455,30 @@ async fn dispatch_command(
     state: &AppState,
     last_seq: &mut Option<u64>,
     heartbeats: &mut std::collections::HashMap<String, HeartbeatHandle>,
+    replay_capable: bool,
 ) {
     match cmd {
         ClientCommand::Subscribe { identifier } => {
+            if state.replay_enforcement.is_enforcing() && !replay_capable {
+                state
+                    .metrics
+                    .handshake_rejected_non_replay_capable_total
+                    .inc();
+                tracing::warn!(
+                    ctx.conn_id,
+                    identifier,
+                    enforcement = ?state.replay_enforcement,
+                    "subscribe rejected: replay_v1 capability required"
+                );
+                if let Ok(reject) = ctx
+                    .codec
+                    .encode(&ServerMessage::RejectSubscription { identifier })
+                {
+                    let _ = ctx.tx.send(reject).await;
+                }
+                return;
+            }
+
             if !jwt::is_allowed(ctx.allowed_streams, &identifier) {
                 tracing::warn!(
                     ctx.conn_id,

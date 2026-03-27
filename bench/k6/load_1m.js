@@ -30,8 +30,8 @@
  */
 
 import ws from 'k6/ws';
-import { check } from 'k6';
-import { Counter, Gauge, Rate, Trend } from 'k6/metrics';
+import { check, sleep } from 'k6';
+import { Counter, Rate, Trend } from 'k6/metrics';
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -59,8 +59,10 @@ const tcConnectionErrors  = new Counter('tc_connection_errors');
 const tcSubscribeOk       = new Counter('tc_subscribe_confirmed');
 /** Rate of successful WebSocket upgrades. */
 const tcConnectSuccess    = new Rate('tc_connect_success');
-/** Current active connections (gauge, updated on open/close). */
-const tcActiveConns       = new Gauge('tc_active_connections');
+/** WebSocket connections opened (use with tc_connections_closed to derive active count). */
+const tcConnectionsOpened = new Counter('tc_connections_opened');
+/** WebSocket connections closed. */
+const tcConnectionsClosed = new Counter('tc_connections_closed');
 
 // ── k6 scenario options ────────────────────────────────────────────────────────
 
@@ -87,6 +89,14 @@ export const options = {
     tc_connection_errors:  ['count<100'],
   },
 };
+
+// ── Per-VU reconnect state ─────────────────────────────────────────────────────
+// Module-level variables persist across iterations within the same VU, allowing
+// the VU to send a `hello` with its last known sequence on reconnect so the
+// server can replay any missed messages.
+
+/** Last publisher sequence number received by this VU (-1 = never connected). */
+let vuLastSeq = -1;
 
 // ── Helper ─────────────────────────────────────────────────────────────────────
 
@@ -118,14 +128,23 @@ export default function () {
   const subprotocol =
     PROTOCOL === 'msgpack' ? 'actioncable-v1-msgpack' : 'actioncable-v1-json';
 
-  let lastSeq = -1;
+  // Pick up where this VU left off (vuLastSeq persists across iterations).
+  let lastSeq = vuLastSeq;
+  const isReconnect = lastSeq >= 0;
 
   const res = ws.connect(URL, { headers, subprotocols: [subprotocol] }, function (socket) {
-    tcActiveConns.add(1);
+    tcConnectionsOpened.add(1);
 
     // ── Open ────────────────────────────────────────────────────────────────
     socket.on('open', function () {
       tcConnectSuccess.add(true);
+
+      // On reconnect, tell the server the last sequence we received so it can
+      // replay any messages we missed while disconnected.
+      if (isReconnect) {
+        socket.send(JSON.stringify({ type: 'hello', last_seq: String(lastSeq) }));
+      }
+
       socket.send(JSON.stringify({ command: 'subscribe', identifier }));
     });
 
@@ -148,25 +167,41 @@ export default function () {
           break;
 
         default:
-          // Fan-out message from tc-publish.
+          // Fan-out message from tc-publish (live or replayed).
           if ((msg.identifier === identifier || msg.identifier === STREAM) && msg.message) {
-            tcMessagesReceived.add(1);
+            // Skip replayed messages in gap and latency accounting — they arrived
+            // out of the live sequence and would inflate both metrics.
+            const replayed = msg.replayed === true;
 
-            // Latency: publisher embeds sent_at (Unix ms); we measure receipt time.
-            if (msg.message.sent_at !== undefined) {
-              const latency = Date.now() - Number(msg.message.sent_at);
-              if (latency >= 0 && latency < 30_000) {
-                tcFanoutLatencyMs.add(latency);
-              }
-            }
+            if (!replayed) {
+              tcMessagesReceived.add(1);
 
-            // Sequence tracking: detect any gaps (dropped messages).
-            if (msg.message.seq !== undefined) {
-              const seq = Number(msg.message.seq);
-              if (lastSeq >= 0 && seq !== lastSeq + 1) {
-                tcSequenceGaps.add(Math.max(0, seq - lastSeq - 1));
+              // Latency: publisher embeds sent_at (Unix ms); we measure receipt time.
+              if (msg.message.sent_at !== undefined) {
+                const latency = Date.now() - Number(msg.message.sent_at);
+                if (latency >= 0 && latency < 30_000) {
+                  tcFanoutLatencyMs.add(latency);
+                }
               }
-              lastSeq = seq;
+
+              // Sequence tracking: detect any gaps (dropped messages).
+              // Only check against the previous live message — gaps caused by
+              // the reconnect window are already captured by this metric.
+              // Server frame carries JetStream sequence as a top-level `seq` field.
+              // Some publishers may also include `seq` inside the payload; prefer top-level.
+              const seqRaw =
+                msg.seq !== undefined ? msg.seq :
+                (msg.message && msg.message.seq !== undefined ? msg.message.seq : undefined);
+              if (seqRaw !== undefined) {
+                const seq = Number(seqRaw);
+                if (!Number.isNaN(seq)) {
+                  if (lastSeq >= 0 && seq !== lastSeq + 1) {
+                    tcSequenceGaps.add(Math.max(0, seq - lastSeq - 1));
+                  }
+                  lastSeq = seq;
+                  vuLastSeq = seq;  // Persist for the next reconnect iteration.
+                }
+              }
             }
           }
       }
@@ -180,7 +215,7 @@ export default function () {
 
     // ── Close ────────────────────────────────────────────────────────────────
     socket.on('close', function () {
-      tcActiveConns.add(-1);
+      tcConnectionsClosed.add(1);
     });
 
     // Hold the connection open for the entire test; k6 tears down VUs at scenario end.
@@ -194,5 +229,11 @@ export default function () {
   if (!upgraded) {
     tcConnectSuccess.add(false);
     tcConnectionErrors.add(1);
+  }
+
+  // If this VU has a lastSeq (i.e. it connected before and is now reconnecting),
+  // back off briefly to avoid a thundering-herd of reconnects all at once.
+  if (vuLastSeq >= 0) {
+    sleep(1 + Math.random() * 2);
   }
 }

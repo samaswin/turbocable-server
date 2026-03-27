@@ -28,6 +28,7 @@ STREAM="${STREAM:-bench}"
 RAMP_DURATION="${RAMP_DURATION:-2m}"
 DURATION="${DURATION:-10m}"
 PUBLISH_RATE="${PUBLISH_RATE:-500}"  # msg/s during sustained phase
+PROTOCOL="${PROTOCOL:-json}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -136,6 +137,7 @@ k6 run "$K6_SCRIPT" \
     -e STREAM="$STREAM" \
     -e RAMP_DURATION="$RAMP_DURATION" \
     -e DURATION="$DURATION" \
+    -e PROTOCOL="$PROTOCOL" \
     -e "LATENCY_P99_MS=$LATENCY_P99_MS" \
     --summary-export="$K6_LOAD_SUMMARY"
 k6_rc=$?

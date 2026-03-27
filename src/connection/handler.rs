@@ -22,9 +22,6 @@ use crate::protocol::types::{ClientCommand, ServerMessage};
 use crate::protocol::{self, Codec, SUB_PROTOCOL_JSON, SUB_PROTOCOL_MSGPACK};
 use crate::pubsub::nats::NatsConsumer;
 
-/// Per-connection outbound channel capacity before back-pressure kicks in.
-const CHANNEL_CAPACITY: usize = 64;
-
 /// WebSocket close code sent when JWT authentication fails.
 const WS_CLOSE_AUTH_FAILED: u16 = 3000;
 
@@ -50,6 +47,8 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// Shutdown broadcast: resolves to `true` when the server is draining.
     pub shutdown_rx: watch::Receiver<bool>,
+    /// Per-connection outbound mpsc channel capacity.
+    pub ws_channel_capacity: usize,
 }
 
 /// Query parameters extracted from the WebSocket upgrade URL.
@@ -188,7 +187,7 @@ async fn handle_socket(
 
     let is_binary = protocol == SUB_PROTOCOL_MSGPACK;
     let conn_id = state.registry.allocate_id();
-    let (tx, rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
+    let (tx, rx) = mpsc::channel::<Bytes>(state.ws_channel_capacity);
     state.registry.register(conn_id, tx.clone(), is_binary);
 
     state.metrics.connections_total.inc();

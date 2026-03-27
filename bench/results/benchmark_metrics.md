@@ -74,3 +74,25 @@ Optional raw k6 JSON: `bench/results/artifacts/k6-*.json` (gitignored by default
 \* Publisher message count is approximate (integer rate × duration).
 
 ---
+
+## Single-node load (load_1m.js) — `2026-03-27 15:51:19 UTC`
+
+| Field | Value |
+|-------|-------|
+| **k6 wall time (script)** | 276s |
+| **tc-publish (send)** | 50 msg/s × 360s ≈ **18000** messages published* |
+
+\* Publisher message count is approximate (integer rate × duration).
+
+---
+
+## Single-node load (load_1m.js) — `2026-03-27 16:09:56 UTC`
+
+| Field | Value |
+|-------|-------|
+| **k6 wall time (script)** | 276s |
+| **tc-publish (send)** | 25 msg/s × 360s ≈ **9000** messages published* |
+
+\* Publisher message count is approximate (integer rate × duration).
+
+---

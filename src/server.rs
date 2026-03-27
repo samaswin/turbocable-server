@@ -53,6 +53,7 @@ pub async fn run(cfg: Config) {
         presence,
         metrics,
         shutdown_rx,
+        ws_channel_capacity: cfg.ws_channel_capacity,
     };
 
     let app = Router::new()

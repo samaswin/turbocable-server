@@ -23,7 +23,7 @@ use crate::protocol::{self, Codec, SUB_PROTOCOL_JSON, SUB_PROTOCOL_MSGPACK};
 use crate::pubsub::nats::NatsConsumer;
 
 /// Per-connection outbound channel capacity before back-pressure kicks in.
-const CHANNEL_CAPACITY: usize = 16;
+const CHANNEL_CAPACITY: usize = 64;
 
 /// WebSocket close code sent when JWT authentication fails.
 const WS_CLOSE_AUTH_FAILED: u16 = 3000;
@@ -277,10 +277,10 @@ async fn outbound_loop(
 /// JSON connection — the frame is silently dropped rather than closing the socket.
 fn bytes_to_ws_msg(payload: Bytes, is_binary: bool) -> Option<Message> {
     if is_binary {
-        Some(Message::Binary(payload.to_vec()))
+        Some(Message::Binary(payload.into()))
     } else {
-        match String::from_utf8(payload.to_vec()) {
-            Ok(text) => Some(Message::Text(text)),
+        match std::str::from_utf8(&payload) {
+            Ok(s) => Some(Message::Text(s.to_owned())),
             Err(e) => {
                 tracing::warn!("non-UTF-8 payload on JSON connection: {e}");
                 None

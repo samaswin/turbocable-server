@@ -43,11 +43,14 @@ impl Default for Registry {
 
 impl Registry {
     /// Creates a new registry pre-allocated for ~1.1M connections.
+    ///
+    /// Uses 128 shards on all three maps to reduce lock contention at 100 K+
+    /// concurrent subscribe/deregister operations (default is `num_cpus × 4`).
     pub fn new() -> Self {
         Self {
-            connections: DashMap::with_capacity(1_100_000),
-            streams: DashMap::new(),
-            conn_streams: DashMap::with_capacity(1_100_000),
+            connections: DashMap::with_capacity_and_shard_amount(1_100_000, 128),
+            streams: DashMap::with_shard_amount(128),
+            conn_streams: DashMap::with_capacity_and_shard_amount(1_100_000, 128),
             next_id: AtomicU64::new(1),
             active: AtomicU64::new(0),
         }

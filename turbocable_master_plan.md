@@ -1151,7 +1151,7 @@ pub struct Metrics {
     pub connections_rejected: GenericCounter<AtomicU64>,
     pub auth_rejected:        GenericCounter<AtomicU64>,
     pub messages_fanned_out:  GenericCounter<AtomicU64>,
-    pub messages_dropped:     GenericCounter<AtomicU64>,
+    pub forced_reconnect_backpressure: GenericCounter<AtomicU64>, // full outbound → eviction + replay
     pub fanout_duration:      Histogram,   // p99 target: < 50ms
     pub nats_lag:             GenericGauge<AtomicI64>,  // consumer lag
 }
@@ -1163,7 +1163,7 @@ Build a Grafana dashboard with these panels:
 - Fan-out p99 latency (target < 50ms)
 - Messages/sec fanned out
 - NATS consumer lag (should stay near 0)
-- Dropped messages (should be 0)
+- Backpressure reconnects (should be near 0 in steady state; spikes indicate slow clients or small outbound buffers)
 
 ---
 

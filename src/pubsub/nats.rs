@@ -388,7 +388,6 @@ fn process_nats_message(
     }
     if !result.evicted.is_empty() {
         let count = result.evicted.len() as u64;
-        metrics.messages_dropped.inc_by(count);
         metrics.forced_reconnect_backpressure_total.inc_by(count);
         tracing::debug!(
             stream = stream_name,

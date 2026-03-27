@@ -95,7 +95,7 @@ fn bench_fanout_mixed_codecs(c: &mut Criterion) {
     group.finish();
 }
 
-/// Back-pressure path: fan-out when all channel buffers are full (try_send drops).
+/// Back-pressure path: all outbound buffers full — each overflow signals eviction and deregistration.
 fn bench_fanout_backpressure(c: &mut Criterion) {
     let mut group = c.benchmark_group("fanout_backpressure");
     group.sample_size(20);
@@ -110,7 +110,9 @@ fn bench_fanout_backpressure(c: &mut Criterion) {
                 let mut receivers = Vec::with_capacity(n);
 
                 for _ in 0..n {
-                    // Capacity 1: fill it immediately, then the overflow fanout evicts.
+                    // Capacity 1: first fanout below fills each buffer; the next fanout overflows
+                    // and evicts every connection (first b.iter iteration is the hot eviction path;
+                    // later iterations mostly hit an empty subscriber list).
                     let (tx, rx) = tokio::sync::mpsc::channel(1);
                     let (evict_tx, _evict_rx) = mpsc::channel(1);
                     let id = registry.allocate_id();
@@ -122,7 +124,6 @@ fn bench_fanout_backpressure(c: &mut Criterion) {
                 let json = Bytes::from_static(JSON_PAYLOAD);
                 let binary = Bytes::from_static(MSGPACK_PAYLOAD);
 
-                // Fill all channels so subsequent iterations exercise the drop path.
                 registry.fanout_encoded("bench_stream", json.clone(), binary.clone());
 
                 b.iter(|| registry.fanout_encoded("bench_stream", json.clone(), binary.clone()));

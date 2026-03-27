@@ -207,7 +207,10 @@ async fn handle_socket(
             reason: "backpressure_reconnect_required".to_string(),
             reconnect: Some(true),
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "failed to encode backpressure disconnect frame");
+            Bytes::new()
+        });
 
     state.metrics.connections_total.inc();
     state.metrics.connections_active.inc();

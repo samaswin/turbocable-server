@@ -113,8 +113,9 @@ Phase minimums (if rolling out enforcement):
 ```
 bench/
 ├── k6/
-│   ├── load_1m.js           Main k6 WebSocket load test (single-node + cluster agents)
-│   └── reconnect_test.js    Reconnect + replay validation
+│   ├── load_1m.js                    Main k6 WebSocket load test (single-node + cluster agents)
+│   ├── reconnect_test.js             Reconnect + replay validation
+│   └── backpressure_eviction_test.js Optional: slow drain + backpressure disconnect + replay
 └── scripts/
     ├── run_full_test_plan.sh   Health → reconnect → crash recovery → sustained load (WSL-friendly defaults)
     ├── run_single_node.sh      Single-node k6 + tc-publish wrapper
@@ -139,7 +140,7 @@ infra/
 │   ├── nats2.conf              NATS node n2 config
 │   └── nats3.conf              NATS node n3 config
 ├── alertmanager/
-│   ├── turbocable.rules.yml    Prometheus alerting rules (lag, drop, latency)
+│   ├── turbocable.rules.yml    Prometheus alerting rules (lag, backpressure reconnect, latency)
 │   └── alertmanager.yml        Alertmanager routing (PagerDuty + Slack template)
 ├── docker-compose.monitoring.yml  Prometheus + Alertmanager + Grafana stack
 ├── prometheus/
@@ -161,6 +162,7 @@ Work through these in order; do not jump straight to 1M on untuned hardware.
 |------|------|--------|
 | **Smoke** | ~1k connections, paths work | Below; `run_single_node.sh` |
 | **Reconnect** | Replay after disconnect, zero gaps | `bench/k6/reconnect_test.js` |
+| **Backpressure** | Eviction disconnect + replay (optional; needs tuning) | `bench/k6/backpressure_eviction_test.js` |
 | **Crash recovery** | SIGKILL gateway, no lost fan-out | `bench/scripts/crash_recovery_test.sh` |
 | **Single node** | ~333k connections, p99 latency budget | `bench/scripts/run_single_node.sh` |
 | **Cluster** | ~1M connections via LB + 3 gateways | `bench/scripts/run_cluster.sh` |
@@ -307,6 +309,10 @@ tc_connection_errors count < 10
 | `tc_reconnect_success` | Rate of successful reconnect WS upgrades |
 | `tc_connection_errors` | Total connection errors across both segments |
 
+### Backpressure eviction (optional)
+
+`bench/k6/backpressure_eviction_test.js` sends `hello` with `replay_v1`, subscribes, and optionally adds `SLOW_SLEEP_S` delay per message so the gateway may fill the outbound channel and send `disconnect` with `backpressure_reconnect_required`. After a gap, it reconnects with `last_seq` and must keep `tc_sequence_gaps == 0`. Set `REQUIRE_BACKPRESSURE_EVICT=1` only after tuning `TURBOCABLE_WS_CHANNEL_CAPACITY`, publish rate, and `SLOW_SLEEP_S` so eviction actually occurs.
+
 ---
 
 ## Crash recovery test
@@ -422,7 +428,7 @@ Benchmarks cover:
 
 - `fanout_json` — all-JSON clients at 1k / 10k / 100k connections
 - `fanout_mixed_codecs` — 50 % JSON + 50 % MessagePack at 1k / 10k / 100k
-- `fanout_backpressure` — drop path when all channel buffers are full
+- `fanout_backpressure` — overflow path when all outbound buffers are full (eviction + deregister; first iteration evicts all subscribers, later iterations are mostly no-op)
 - `subscribe_deregister` — register + subscribe (3 streams) + deregister × 1000
 
 Results are saved to `target/criterion/` with an HTML report.
@@ -463,7 +469,7 @@ sysctl net.core.somaxconn
 | `turbocable_connections_total` | Total connections since startup |
 | `turbocable_connections_rejected_total` | Auth / rate-limit rejections |
 | `turbocable_messages_fanned_out_total` | Messages delivered to clients |
-| `turbocable_messages_dropped_total` | Messages dropped (slow clients) |
+| `turbocable_forced_reconnect_backpressure_total` | Connections evicted when outbound channel is full (client should reconnect and replay; not silent loss) |
 | `turbocable_fanout_duration_seconds` | Fan-out latency histogram |
 | `turbocable_nats_consumer_lag` | NATS pending message backlog |
 

@@ -173,8 +173,8 @@
         },
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "sum(rate(turbocable_messages_dropped_total[1m]))",
-          "legendFormat": "dropped/s",
+          "expr": "sum(rate(turbocable_forced_reconnect_backpressure_total[1m]))",
+          "legendFormat": "backpressure reconnects/s",
           "refId": "B"
         }
       ]

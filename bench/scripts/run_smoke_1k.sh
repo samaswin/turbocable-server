@@ -169,15 +169,15 @@ for _ in {1..50}; do
 done
 curl -fsS "${HEALTH_URL}" || { echo "ERROR: gateway not healthy (check ${GATEWAY_LOG})"; exit 1; }
 
-echo "==> Starting metrics watcher (drops/lag/active) every 2s"
+echo "==> Starting metrics watcher (backpressure reconnects/lag/active) every 2s"
 (
   while true; do
     ts="$(date -u +%H:%M:%S)"
     m="$(curl -fsS "${METRICS_URL}" || true)"
     active="$(awk '/^turbocable_connections_active /{print $2}' <<<"$m")"
-    dropped="$(awk '/^turbocable_messages_dropped_total /{print $2}' <<<"$m")"
+    backpressure="$(awk '/^turbocable_forced_reconnect_backpressure_total /{print $2}' <<<"$m")"
     lag="$(awk '/^turbocable_nats_consumer_lag /{print $2}' <<<"$m")"
-    echo "${ts} active=${active:-?} dropped=${dropped:-?} lag=${lag:-?}"
+    echo "${ts} active=${active:-?} backpressure_reconnects=${backpressure:-?} lag=${lag:-?}"
     sleep 2
   done
 ) &

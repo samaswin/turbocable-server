@@ -196,14 +196,21 @@ Client connects: GET /cable?token=<JWT>
 
 fn fanout_encoded(&self, stream: &str, json: Bytes, msgpack: Bytes) {
     // DashMap shard lock held for microseconds
-    let targets = self.streams.get(stream);
+    let subscribers = self.streams.get(stream);
 
-    for conn_id in targets {
-        let payload = if conn.is_binary { msgpack.clone() } else { json.clone() };
-        // Bytes::clone() = 1 atomic refcount increment (~1ns)
-        // try_send = non-blocking, never allocates
-        conn.sender.try_send(payload);
-        // If channel full → skip (slow client protection)
+    for &conn_id in subscribers.iter() {
+        if let Some(entry) = self.connections.get(&conn_id) {
+            let payload = if entry.is_binary { msgpack.clone() } else { json.clone() };
+            // Bytes::clone() = 1 atomic refcount increment (~1ns)
+            // try_send = non-blocking, never allocates
+            match entry.sender.try_send(payload) {
+                Ok(()) => {}
+                Err(_) => {
+                    let _ = entry.evict_tx.try_send(());
+                    // outbound_loop sends disconnect(reconnect=true); registry deregisters
+                }
+            }
+        }
     }
 }
 ```

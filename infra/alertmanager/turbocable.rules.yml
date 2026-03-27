@@ -142,24 +142,24 @@ groups:
             Gateway {{ $labels.instance }} p99 fan-out latency is
             {{ $value | humanizeDuration }}, which breaches the 1M-connection SLO.
 
-      # ── Message drop rate ────────────────────────────────────────────────────
+      # ── Backpressure reconnect rate ───────────────────────────────────────────
       #
-      # Messages are dropped when a client's outbound channel is full (slow client).
-      # A non-zero drop rate is normal under extreme back-pressure but any
-      # sustained drop rate indicates clients are falling behind.
+      # When a client's outbound channel is full, the gateway evicts the connection
+      # with a disconnect frame (reconnect=true) so the client can replay from last_seq.
+      # A sustained rate indicates slow consumers or an undersized outbound buffer.
 
-      - alert: MessageDropRateNonZero
-        expr: rate(turbocable_messages_dropped_total[2m]) > 0
+      - alert: BackpressureReconnectRateNonZero
+        expr: rate(turbocable_forced_reconnect_backpressure_total[2m]) > 0
         for: 2m
         labels:
           severity: warning
         annotations:
-          summary: "Messages are being dropped (slow clients)"
+          summary: "Backpressure-driven reconnects (recoverable)"
           description: >
-            Gateway {{ $labels.instance }} is dropping
-            {{ $value | humanize }} messages/s.
-            Slow clients are not draining their outbound channels.
-            Consider reducing publish rate or increasing channel capacity.
+            Gateway {{ $labels.instance }} is forcing
+            {{ $value | humanize }} reconnects/s due to full outbound channels.
+            Clients should reconnect and replay; consider reducing publish rate,
+            increasing per-connection outbound capacity, or scaling consumers.
 
   - name: turbocable.auth
     rules:

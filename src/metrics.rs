@@ -17,8 +17,6 @@ pub struct Metrics {
     pub connections_rejected: GenericCounter<AtomicU64>,
     /// Total WebSocket frames delivered to clients via fan-out.
     pub messages_fanned_out: GenericCounter<AtomicU64>,
-    /// Messages dropped due to slow client back-pressure.
-    pub messages_dropped: GenericCounter<AtomicU64>,
     /// Fan-out latency histogram in seconds (p50/p95/p99).
     pub fanout_duration_secs: Histogram,
     /// NATS JetStream consumer pending message count.
@@ -72,12 +70,6 @@ impl Metrics {
         let messages_fanned_out = prometheus::register_int_counter!(
             "turbocable_messages_fanned_out_total",
             "Total WebSocket frames delivered to clients via fan-out"
-        )
-        .expect("metric registration failed");
-
-        let messages_dropped = prometheus::register_int_counter!(
-            "turbocable_messages_dropped_total",
-            "Messages dropped due to slow client back-pressure"
         )
         .expect("metric registration failed");
 
@@ -146,7 +138,6 @@ impl Metrics {
             connections_total,
             connections_rejected,
             messages_fanned_out,
-            messages_dropped,
             fanout_duration_secs,
             nats_consumer_lag,
             auth_duration_secs,

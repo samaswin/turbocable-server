@@ -88,6 +88,21 @@ print(secs(r) + secs(d) + 120)
 fi
 LATENCY_P99_MS="${LATENCY_P99_MS:-50}"
 
+# --- Purge NATS stream ---
+# A fresh consumer uses DeliverPolicy::All (needed for reconnect replay), so if
+# the stream has messages from prior runs, the server will replay them all as a
+# burst before processing live messages — corrupting latency and sequence metrics.
+# Always purge before benchmarking so every run starts from a clean state.
+if command -v nats &>/dev/null; then
+    echo "--> Purging NATS stream: TURBOCABLE"
+    nats stream purge TURBOCABLE --force 2>/dev/null \
+        || echo "WARNING: stream purge failed (stream may not exist yet — first run is OK)"
+else
+    echo "WARNING: 'nats' CLI not found — skipping stream purge." >&2
+    echo "         Old messages in the TURBOCABLE stream will cause inflated latency and false sequence gaps." >&2
+    echo "         Install: https://github.com/nats-io/natscli/releases" >&2
+fi
+
 echo "--> Starting tc-publish: $PUBLISH_RATE msg/s for ${PUBLISH_DURATION}s"
 "$PUBLISH_BIN" \
     --nats-url "$NATS_URL" \

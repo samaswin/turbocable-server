@@ -311,9 +311,13 @@ impl NatsConsumer {
 
             process_nats_message(&msg, registry, metrics);
 
-            if let Err(e) = msg.ack().await {
-                tracing::warn!(error = %e, "NATS ack failed");
-            }
+            // Fire the ack in a background task so the fanout loop is never
+            // stalled by the NATS round-trip (publish + flush per message).
+            tokio::spawn(async move {
+                if let Err(e) = msg.ack().await {
+                    tracing::warn!(error = %e, "NATS ack failed");
+                }
+            });
 
             processed += 1;
 

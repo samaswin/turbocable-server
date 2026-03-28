@@ -17,6 +17,7 @@ use crate::auth::jwt::{self, JwtVerifier};
 use crate::config::ReplayEnforcement;
 use crate::connection::limiter::ConnectionLimiter;
 use crate::connection::registry::Registry;
+use crate::errors::ReplayError;
 use crate::metrics::Metrics;
 use crate::presence::{HeartbeatHandle, PresenceManager};
 use crate::protocol::types::{ClientCommand, ClientFrame, ServerMessage};
@@ -28,6 +29,10 @@ const WS_CLOSE_AUTH_FAILED: u16 = 3000;
 
 /// WebSocket close code sent when the server is shutting down (RFC 6455 §7.4.1).
 const WS_CLOSE_GOING_AWAY: u16 = 1001;
+
+/// Max replay frames per `outbound_loop` iteration before re-entering `select!` so eviction,
+/// urgent close, and shutdown stay responsive under huge catch-up backlogs.
+const OUTBOUND_REPLAY_BURST: usize = 512;
 
 /// Per-connection handshake state machine.
 ///
@@ -63,10 +68,15 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// Shutdown broadcast: resolves to `true` when the server is draining.
     pub shutdown_rx: watch::Receiver<bool>,
-    /// Per-connection outbound mpsc channel capacity.
+    /// Per-connection live fan-out mpsc channel capacity.
     pub ws_channel_capacity: usize,
+    /// Per-connection replay catch-up mpsc channel capacity.
+    pub ws_replay_channel_capacity: usize,
     /// Replay enforcement phase — hello ordering and `replay_v1` requirement.
     pub replay_enforcement: ReplayEnforcement,
+    /// Semaphore capping concurrent background replay tasks on this node.
+    /// Excess tasks queue (not dropped) until a slot is free.
+    pub replay_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Query parameters extracted from the WebSocket upgrade URL.
@@ -80,8 +90,14 @@ pub struct WsQueryParams {
 /// Per-connection context bundling the fields that are fixed for the lifetime of one connection.
 struct ConnContext<'a> {
     conn_id: u64,
-    codec: &'a dyn Codec,
-    tx: &'a mpsc::Sender<Bytes>,
+    /// Arc so the codec can be cheaply cloned into background replay tasks.
+    codec: Arc<dyn Codec>,
+    /// Live NATS fan-out and normal server frames (welcome, ping, confirms without replay).
+    live_tx: &'a mpsc::Sender<Bytes>,
+    /// JetStream replay catch-up; drained before live in `outbound_loop` for ordering.
+    replay_tx: &'a mpsc::Sender<Bytes>,
+    /// Pre-encoded disconnect + WebSocket close (retention gap, replay cap).
+    urgent_close_tx: &'a mpsc::Sender<Bytes>,
     allowed_streams: &'a [String],
     user_id: Option<&'a str>,
 }
@@ -190,15 +206,19 @@ async fn handle_socket(
         (vec![String::from("*")], None)
     };
 
-    let codec = protocol::codec_for_protocol(protocol).expect("negotiated protocol must be valid");
+    let codec: Arc<dyn Codec> = Arc::from(
+        protocol::codec_for_protocol(protocol).expect("negotiated protocol must be valid"),
+    );
 
     let is_binary = protocol == SUB_PROTOCOL_MSGPACK;
     let conn_id = state.registry.allocate_id();
-    let (tx, rx) = mpsc::channel::<Bytes>(state.ws_channel_capacity);
+    let (live_tx, live_rx) = mpsc::channel::<Bytes>(state.ws_channel_capacity);
+    let (replay_tx, replay_rx) = mpsc::channel::<Bytes>(state.ws_replay_channel_capacity);
+    let (urgent_close_tx, urgent_close_rx) = mpsc::channel::<Bytes>(1);
     let (evict_tx, evict_rx) = mpsc::channel::<()>(1);
     state
         .registry
-        .register(conn_id, tx.clone(), is_binary, evict_tx);
+        .register(conn_id, live_tx.clone(), is_binary, evict_tx);
 
     // Pre-encode the backpressure disconnect frame once so the outbound loop
     // can send it without access to the codec.
@@ -218,13 +238,15 @@ async fn handle_socket(
     tracing::info!(conn_id, %ip, protocol, "connection accepted");
 
     if let Ok(welcome) = codec.encode(&ServerMessage::Welcome) {
-        let _ = tx.send(welcome).await;
+        let _ = live_tx.send(welcome).await;
     }
 
     let (ws_sender, ws_receiver) = socket.split();
 
     let outbound_handle = tokio::spawn(outbound_loop(
-        rx,
+        live_rx,
+        replay_rx,
+        urgent_close_rx,
         ws_sender,
         is_binary,
         state.shutdown_rx.clone(),
@@ -234,8 +256,10 @@ async fn handle_socket(
 
     let ctx = ConnContext {
         conn_id,
-        codec: &*codec,
-        tx: &tx,
+        codec: Arc::clone(&codec),
+        live_tx: &live_tx,
+        replay_tx: &replay_tx,
+        urgent_close_tx: &urgent_close_tx,
         allowed_streams: &allowed_streams,
         user_id: user_id.as_deref(),
     };
@@ -244,21 +268,27 @@ async fn handle_socket(
     state.registry.deregister(conn_id);
     state.metrics.connections_active.dec();
     state.limiter.release(ip);
-    drop(tx);
+    drop(live_tx);
+    drop(replay_tx);
+    drop(urgent_close_tx);
     let _ = outbound_handle.await;
 
     tracing::info!(conn_id, %ip, "connection closed");
 }
 
 async fn outbound_loop(
-    mut rx: mpsc::Receiver<Bytes>,
+    mut live_rx: mpsc::Receiver<Bytes>,
+    mut replay_rx: mpsc::Receiver<Bytes>,
+    mut urgent_close_rx: mpsc::Receiver<Bytes>,
     mut sender: SplitSink<WebSocket, Message>,
     is_binary: bool,
     mut shutdown_rx: watch::Receiver<bool>,
     mut evict_rx: mpsc::Receiver<()>,
     disconnect_frame: Bytes,
 ) {
-    loop {
+    let mut urgent_open = true;
+
+    'ws: loop {
         tokio::select! {
             biased;
 
@@ -271,21 +301,28 @@ async fn outbound_loop(
                 return;
             }
 
-            payload = rx.recv() => {
-                match payload {
+            urgent = urgent_close_rx.recv(), if urgent_open => {
+                match urgent {
                     Some(payload) => {
                         if let Some(msg) = bytes_to_ws_msg(payload, is_binary) {
-                            if sender.send(msg).await.is_err() {
-                                break;
-                            }
+                            let _ = sender.send(msg).await;
                         }
+                        let _ = sender.close().await;
+                        return;
                     }
-                    None => break,
+                    None => urgent_open = false,
                 }
             }
+
             _ = shutdown_rx.changed() => {
-                // Drain any queued outbound messages before closing.
-                while let Ok(payload) = rx.try_recv() {
+                while let Ok(payload) = replay_rx.try_recv() {
+                    if let Some(msg) = bytes_to_ws_msg(payload, is_binary) {
+                        if sender.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                while let Ok(payload) = live_rx.try_recv() {
                     if let Some(msg) = bytes_to_ws_msg(payload, is_binary) {
                         if sender.send(msg).await.is_err() {
                             break;
@@ -299,6 +336,40 @@ async fn outbound_loop(
                     })))
                     .await;
                 return;
+            }
+
+            // Replay before live so catch-up always precedes live fan-out on this socket.
+            replay = replay_rx.recv() => {
+                if let Some(payload) = replay {
+                    if let Some(msg) = bytes_to_ws_msg(payload, is_binary) {
+                        if sender.send(msg).await.is_err() {
+                            break 'ws;
+                        }
+                    }
+                    for _ in 0..OUTBOUND_REPLAY_BURST.saturating_sub(1) {
+                        let Ok(payload) = replay_rx.try_recv() else {
+                            break;
+                        };
+                        if let Some(msg) = bytes_to_ws_msg(payload, is_binary) {
+                            if sender.send(msg).await.is_err() {
+                                break 'ws;
+                            }
+                        }
+                    }
+                }
+            }
+
+            payload = live_rx.recv() => {
+                match payload {
+                    Some(payload) => {
+                        if let Some(msg) = bytes_to_ws_msg(payload, is_binary) {
+                            if sender.send(msg).await.is_err() {
+                                break 'ws;
+                            }
+                        }
+                    }
+                    None => break 'ws,
+                }
             }
         }
     }
@@ -380,7 +451,7 @@ async fn inbound_loop(
                     .unwrap_or_default()
                     .as_secs();
                 if let Ok(ping) = ctx.codec.encode(&ServerMessage::Ping { message: ts }) {
-                    if ctx.tx.send(ping).await.is_err() {
+                    if ctx.live_tx.send(ping).await.is_err() {
                         break;
                     }
                 }
@@ -457,7 +528,7 @@ async fn handle_client_frame(
                         if let Ok(reject) = ctx.codec.encode(&ServerMessage::RejectSubscription {
                             identifier: identifier.clone(),
                         }) {
-                            let _ = ctx.tx.send(reject).await;
+                            let _ = ctx.live_tx.send(reject).await;
                         }
                     }
                     return;
@@ -504,7 +575,7 @@ async fn dispatch_command(
                     .codec
                     .encode(&ServerMessage::RejectSubscription { identifier })
                 {
-                    let _ = ctx.tx.send(reject).await;
+                    let _ = ctx.live_tx.send(reject).await;
                 }
                 return;
             }
@@ -519,7 +590,7 @@ async fn dispatch_command(
                     .codec
                     .encode(&ServerMessage::RejectSubscription { identifier })
                 {
-                    let _ = ctx.tx.send(reject).await;
+                    let _ = ctx.live_tx.send(reject).await;
                 }
                 return;
             }
@@ -540,17 +611,132 @@ async fn dispatch_command(
                 );
             }
 
-            // Replay missed messages when client reconnected with last_seq.
-            // Happens before confirm so the client receives replayed messages first.
-            if let Some(seq) = *last_seq {
-                replay_for_stream(&identifier, seq, ctx.conn_id, ctx.codec, ctx.tx, state).await;
-            }
-
-            if let Ok(confirm) = ctx
-                .codec
-                .encode(&ServerMessage::ConfirmSubscription { identifier })
+            // When the client reconnected with a last_seq, spawn a background replay
+            // task to stream missed messages before the confirm.  The background task
+            // sends the confirm itself so the client receives replayed messages first.
+            // The inbound loop is not blocked during replay.
+            if let (Some(seq), Some(nats)) =
+                (*last_seq, state.nats_consumer.as_ref().map(Arc::clone))
             {
-                let _ = ctx.tx.send(confirm).await;
+                let semaphore = Arc::clone(&state.replay_semaphore);
+                let task_replay_tx = ctx.replay_tx.clone();
+                let task_urgent_tx = ctx.urgent_close_tx.clone();
+                let task_codec = Arc::clone(&ctx.codec);
+                let task_metrics = Arc::clone(&state.metrics);
+                let task_stream = identifier.clone();
+                let conn_id = ctx.conn_id;
+
+                tokio::spawn(async move {
+                    // Queue until a replay slot is free; abort cleanly on shutdown.
+                    let _permit = match semaphore.acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return, // Semaphore closed (server shutting down).
+                    };
+
+                    task_metrics.replay_in_flight.inc();
+                    let result = nats
+                        .replay_since(
+                            &task_stream,
+                            seq,
+                            task_replay_tx.clone(),
+                            task_codec.clone(),
+                        )
+                        .await;
+                    task_metrics.replay_in_flight.dec();
+
+                    match result {
+                        Ok(d) if d.peer_gone => {
+                            tracing::debug!(
+                                conn_id,
+                                stream = %task_stream,
+                                delivered = d.delivered,
+                                "replay aborted: peer outbound closed"
+                            );
+                            task_metrics.replay_aborted_peer_gone_total.inc();
+                        }
+                        Ok(d) => {
+                            tracing::info!(
+                                conn_id,
+                                stream = %task_stream,
+                                count = d.delivered,
+                                "replay completed"
+                            );
+                            task_metrics.replay_success_total.inc();
+                            if let Ok(confirm) =
+                                task_codec.encode(&ServerMessage::ConfirmSubscription {
+                                    identifier: task_stream,
+                                })
+                            {
+                                let _ = task_replay_tx.send(confirm).await;
+                            }
+                        }
+                        Err(ReplayError::WindowExceeded {
+                            ref stream,
+                            requested_seq,
+                            oldest_available,
+                        }) => {
+                            tracing::warn!(
+                                conn_id,
+                                stream = %stream,
+                                requested_seq,
+                                oldest_available,
+                                "replay window exceeded: disconnecting for full resync"
+                            );
+                            task_metrics.replay_window_exceeded_total.inc();
+                            if let Ok(disconnect) = task_codec.encode(&ServerMessage::Disconnect {
+                                reason: "replay_window_exceeded".to_string(),
+                                reconnect: Some(true),
+                            }) {
+                                let _ = task_urgent_tx.send(disconnect).await;
+                            }
+                        }
+                        Err(ReplayError::Truncated {
+                            ref stream,
+                            delivered,
+                            limit,
+                        }) => {
+                            tracing::warn!(
+                                conn_id,
+                                stream = %stream,
+                                delivered,
+                                limit,
+                                "replay truncated at cap: disconnecting for continued catch-up"
+                            );
+                            task_metrics.replay_truncated_total.inc();
+                            if let Ok(disconnect) = task_codec.encode(&ServerMessage::Disconnect {
+                                reason: "replay_truncated".to_string(),
+                                reconnect: Some(true),
+                            }) {
+                                let _ = task_urgent_tx.send(disconnect).await;
+                            }
+                        }
+                        Err(ReplayError::JetStream(ref e)) => {
+                            tracing::error!(
+                                conn_id,
+                                stream = %task_stream,
+                                error = %e,
+                                "replay JetStream error"
+                            );
+                            task_metrics.replay_failure_total.inc();
+                            // Still confirm so the client can continue with live messages.
+                            if let Ok(confirm) =
+                                task_codec.encode(&ServerMessage::ConfirmSubscription {
+                                    identifier: task_stream,
+                                })
+                            {
+                                let _ = task_replay_tx.send(confirm).await;
+                            }
+                        }
+                    }
+                });
+            } else {
+                // No replay needed — confirm immediately.
+                if let Ok(confirm) = ctx
+                    .codec
+                    .encode(&ServerMessage::ConfirmSubscription { identifier })
+                {
+                    let _ = ctx.live_tx.send(confirm).await;
+                }
             }
         }
         ClientCommand::Unsubscribe { identifier } => {
@@ -608,58 +794,4 @@ fn stream_key_from_identifier(identifier: &str) -> &str {
         }
     }
     identifier
-}
-
-/// Replays missed messages from JetStream for a specific stream after client reconnection.
-async fn replay_for_stream(
-    stream_name: &str,
-    last_seq: u64,
-    conn_id: u64,
-    codec: &dyn Codec,
-    tx: &mpsc::Sender<Bytes>,
-    state: &AppState,
-) {
-    let nats = match state.nats_consumer {
-        Some(ref n) => n,
-        None => return,
-    };
-
-    match nats.replay_since(stream_name, last_seq).await {
-        Ok(messages) => {
-            tracing::info!(
-                conn_id,
-                stream = stream_name,
-                count = messages.len(),
-                "replaying missed messages"
-            );
-
-            for msg in messages {
-                // Parse the raw NATS payload, falling back to null for unparseable data.
-                let payload: serde_json::Value = serde_json::from_slice(&msg.payload)
-                    .or_else(|_| rmp_serde::from_slice(&msg.payload))
-                    .unwrap_or(serde_json::Value::Null);
-
-                let server_msg = ServerMessage::Message {
-                    identifier: stream_name.to_string(),
-                    message: payload,
-                    replayed: Some(true),
-                    seq: Some(msg.sequence),
-                };
-
-                if let Ok(encoded) = codec.encode(&server_msg) {
-                    if tx.send(encoded).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                conn_id,
-                stream = stream_name,
-                error = %e,
-                "message replay failed"
-            );
-        }
-    }
 }

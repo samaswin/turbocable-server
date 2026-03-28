@@ -19,20 +19,26 @@
 //! ## Replay
 //!
 //! When a client reconnects and sends `{ "type": "hello", "last_seq": "8841" }`,
-//! the handler calls [`NatsConsumer::replay_since`] for each stream the client
-//! subscribes to. An ephemeral consumer with `DeliverPolicy::ByStartSequence`
-//! fetches missed messages in order, delivered with `replayed: true`.
+//! the handler spawns a background task per stream subscription that calls
+//! [`NatsConsumer::replay_since`]. An ephemeral consumer with
+//! `DeliverPolicy::ByStartSequence` streams missed messages in strict sequence
+//! order, delivered with `replayed: true`, directly through the connection's
+//! outbound channel. If `last_seq + 1` is outside the stream's retention window,
+//! [`crate::errors::ReplayError::WindowExceeded`] is returned and the client is
+//! disconnected with `reason: "replay_window_exceeded"` for a full resync.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt;
+use tokio::sync::mpsc;
 
 use crate::connection::registry::Registry;
-use crate::errors::GatewayError;
+use crate::errors::{GatewayError, ReplayDelivery, ReplayError};
 use crate::metrics::Metrics;
 use crate::protocol::types::ServerMessage;
+use crate::protocol::Codec;
 
 /// NATS subject prefix: all TurboCable broadcasts live under `TURBOCABLE.{stream_name}`.
 const SUBJECT_PREFIX: &str = "TURBOCABLE.";
@@ -41,21 +47,18 @@ const SUBJECT_PREFIX: &str = "TURBOCABLE.";
 const STREAM_NAME: &str = "TURBOCABLE";
 
 /// Maximum number of messages replayed per stream during client reconnect.
-const MAX_REPLAY_MESSAGES: usize = 10_000;
+pub const MAX_REPLAY_MESSAGES: usize = 10_000;
 
-/// Timeout when waiting for replay messages from JetStream.
+/// Number of messages to deliver between Tokio scheduler yield points during replay.
+/// Keeps replay tasks from monopolising a worker thread at high catch-up volume.
+const REPLAY_BATCH_SIZE: usize = 500;
+
+/// Timeout when waiting for the next replay message from JetStream.
+/// When no message arrives within this window, replay is considered complete.
 const REPLAY_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Delay before retrying after a NATS consumer error.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
-
-/// A message fetched from JetStream for replay delivery.
-pub struct ReplayMessage {
-    /// JetStream stream sequence number.
-    pub sequence: u64,
-    /// Raw message payload bytes (JSON or MessagePack from the publisher).
-    pub payload: Bytes,
-}
 
 /// NATS JetStream consumer that drives the broadcast fan-out pipeline.
 ///
@@ -141,30 +144,70 @@ impl NatsConsumer {
         Ok(())
     }
 
-    /// Fetches messages from JetStream for a specific stream starting after `last_seq`.
+    /// Replays missed messages from JetStream directly to a connection's outbound channel.
     ///
     /// Used during client reconnection: the client tells us the last sequence it
-    /// received, and we replay everything since then for the requested stream.
-    /// Returns up to [`MAX_REPLAY_MESSAGES`] messages in stream-sequence order.
+    /// received (`last_seq`), and this method streams everything after that up to
+    /// [`MAX_REPLAY_MESSAGES`] in strict sequence order.
+    ///
+    /// # Retention gap detection
+    ///
+    /// Before fetching, the stream's retention window is checked. If `last_seq + 1`
+    /// is older than the stream's oldest available sequence, [`ReplayError::WindowExceeded`]
+    /// is returned so the caller can disconnect the client for a full resync.
+    ///
+    /// # Non-blocking delivery
+    ///
+    /// Messages are forwarded one at a time through `tx`. If `tx` is closed (connection
+    /// gone), the function returns immediately. Every [`REPLAY_BATCH_SIZE`] messages the
+    /// Tokio scheduler is yielded so replay tasks do not starve live fan-out.
     pub async fn replay_since(
         &self,
         stream_name: &str,
         last_seq: u64,
-    ) -> Result<Vec<ReplayMessage>, GatewayError> {
+        tx: mpsc::Sender<Bytes>,
+        codec: Arc<dyn Codec>,
+    ) -> Result<ReplayDelivery, ReplayError> {
         let subject = format!("{SUBJECT_PREFIX}{stream_name}");
+        let requested_seq = last_seq.saturating_add(1);
 
-        let stream = self
+        let mut stream = self
             .jetstream
             .get_stream(STREAM_NAME)
             .await
-            .map_err(|e| GatewayError::JetStream(format!("get stream for replay: {e}")))?;
+            .map_err(|e| ReplayError::JetStream(format!("get stream for replay: {e}")))?;
+
+        // Retention gap detection: if the stream has messages and our start sequence
+        // is older than the oldest retained sequence, the client must full-resync.
+        let info = stream
+            .info()
+            .await
+            .map_err(|e| ReplayError::JetStream(format!("stream info: {e}")))?;
+        let oldest_available = info.state.first_sequence;
+        if info.state.messages > 0 && requested_seq < oldest_available {
+            return Err(ReplayError::WindowExceeded {
+                stream: stream_name.to_string(),
+                requested_seq,
+                oldest_available,
+            });
+        }
+        // Purged / empty stream but the client still holds a non-zero cursor: nothing
+        // left to validate their `last_seq` against — require a full resync.
+        if info.state.messages == 0 && last_seq > 0 {
+            let oldest = oldest_available.max(1);
+            return Err(ReplayError::WindowExceeded {
+                stream: stream_name.to_string(),
+                requested_seq,
+                oldest_available: oldest,
+            });
+        }
 
         // Ephemeral consumer: no durable_name, auto-deleted after inactive_threshold.
         // Starts from the sequence after the client's last-known position.
         let config = async_nats::jetstream::consumer::pull::Config {
             filter_subject: subject,
             deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::ByStartSequence {
-                start_sequence: last_seq + 1,
+                start_sequence: requested_seq,
             },
             ack_policy: async_nats::jetstream::consumer::AckPolicy::None,
             inactive_threshold: Duration::from_secs(30),
@@ -174,46 +217,121 @@ impl NatsConsumer {
         let consumer = stream
             .create_consumer(config)
             .await
-            .map_err(|e| GatewayError::JetStream(format!("create replay consumer: {e}")))?;
+            .map_err(|e| ReplayError::JetStream(format!("create replay consumer: {e}")))?;
 
-        let mut messages = Vec::new();
         let mut msg_stream = consumer
             .messages()
             .await
-            .map_err(|e| GatewayError::JetStream(format!("replay messages stream: {e}")))?;
+            .map_err(|e| ReplayError::JetStream(format!("replay messages stream: {e}")))?;
 
-        // Pull messages with a timeout — when no more messages arrive within
-        // REPLAY_FETCH_TIMEOUT, we consider replay complete.
-        while messages.len() < MAX_REPLAY_MESSAGES {
+        let mut count = 0usize;
+        let mut prev_seq = last_seq;
+
+        // Stream messages directly to the connection, yielding every REPLAY_BATCH_SIZE
+        // messages so this task does not monopolise a Tokio worker thread.
+        while count < MAX_REPLAY_MESSAGES {
             match tokio::time::timeout(REPLAY_FETCH_TIMEOUT, msg_stream.next()).await {
                 Ok(Some(Ok(msg))) => {
-                    let sequence = extract_stream_sequence(&msg);
-                    messages.push(ReplayMessage {
-                        sequence,
-                        payload: msg.payload.clone(),
+                    let Some(sequence) = extract_stream_sequence(&msg) else {
+                        return Err(ReplayError::JetStream(
+                            "replay message missing JetStream stream sequence metadata".to_string(),
+                        ));
+                    };
+
+                    // Enforce strictly monotonic ordering; skip any duplicate or
+                    // out-of-order sequence numbers.
+                    if sequence <= prev_seq {
+                        tracing::warn!(
+                            stream = stream_name,
+                            seq = sequence,
+                            prev = prev_seq,
+                            "replay ordering violation: non-monotonic sequence, skipping"
+                        );
+                        continue;
+                    }
+                    prev_seq = sequence;
+
+                    let payload: serde_json::Value = serde_json::from_slice(&msg.payload)
+                        .or_else(|_| rmp_serde::from_slice(&msg.payload))
+                        .unwrap_or(serde_json::Value::Null);
+
+                    let server_msg = ServerMessage::Message {
+                        identifier: stream_name.to_string(),
+                        message: payload,
+                        replayed: Some(true),
+                        seq: Some(sequence),
+                    };
+
+                    match codec.encode(&server_msg) {
+                        Ok(encoded) => {
+                            // Connection gone — abort silently.
+                            if tx.send(encoded).await.is_err() {
+                                tracing::debug!(
+                                    stream = stream_name,
+                                    "replay aborted: connection gone"
+                                );
+                                return Ok(ReplayDelivery {
+                                    delivered: count,
+                                    peer_gone: true,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                stream = stream_name,
+                                error = %e,
+                                "replay encode error, skipping message"
+                            );
+                            continue;
+                        }
+                    }
+
+                    count += 1;
+
+                    // Yield to the Tokio scheduler between batches.
+                    if count.is_multiple_of(REPLAY_BATCH_SIZE) {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    tracing::warn!(stream = stream_name, error = %e, "error during replay fetch");
+                    break;
+                }
+                // No more messages or timeout — replay is complete.
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        if count == MAX_REPLAY_MESSAGES {
+            match tokio::time::timeout(REPLAY_FETCH_TIMEOUT, msg_stream.next()).await {
+                Ok(Some(Ok(_))) => {
+                    return Err(ReplayError::Truncated {
+                        stream: stream_name.to_string(),
+                        delivered: count,
+                        limit: MAX_REPLAY_MESSAGES,
                     });
                 }
                 Ok(Some(Err(e))) => {
                     tracing::warn!(
                         stream = stream_name,
                         error = %e,
-                        "error during replay fetch"
+                        "replay truncation probe: JetStream error, treating as complete at cap"
                     );
-                    break;
                 }
-                // Stream ended or timeout — replay is complete.
-                Ok(None) | Err(_) => break,
+                Ok(None) | Err(_) => {}
             }
         }
 
         tracing::info!(
             stream = stream_name,
             last_seq,
-            replayed = messages.len(),
+            replayed = count,
             "replay complete"
         );
-
-        Ok(messages)
+        Ok(ReplayDelivery {
+            delivered: count,
+            peer_gone: false,
+        })
     }
 
     /// Flushes all pending outbound NATS data and waits for the server to acknowledge.
@@ -340,9 +458,11 @@ fn extract_stream_name(subject: &str) -> &str {
 }
 
 /// Extracts the JetStream stream sequence number from a consumer message.
-/// Falls back to 0 if the info cannot be parsed (should not happen in practice).
-fn extract_stream_sequence(msg: &async_nats::jetstream::Message) -> u64 {
-    msg.info().map(|info| info.stream_sequence).unwrap_or(0)
+fn extract_stream_sequence(msg: &async_nats::jetstream::Message) -> Option<u64> {
+    match msg.info() {
+        Ok(info) => Some(info.stream_sequence),
+        Err(_) => None,
+    }
 }
 
 /// Decodes a NATS message, pre-encodes it for both wire formats, fans out
@@ -366,7 +486,7 @@ fn process_nats_message(
         identifier: stream_name.to_string(),
         message: payload,
         replayed: None,
-        seq: Some(sequence),
+        seq: sequence,
     };
 
     // Pre-encode once per codec — fanout_encoded routes by connection type.

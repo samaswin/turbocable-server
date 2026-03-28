@@ -42,6 +42,20 @@ pub struct Metrics {
     /// These clients receive a `disconnect` frame with `reconnect=true` and are
     /// expected to reconnect and replay from their last sequence.
     pub forced_reconnect_backpressure_total: GenericCounter<AtomicU64>,
+
+    // --- Replay metrics (Phase 3) ---
+    /// Replay tasks that completed without error.
+    pub replay_success_total: GenericCounter<AtomicU64>,
+    /// Replay tasks that failed with a transient JetStream error.
+    pub replay_failure_total: GenericCounter<AtomicU64>,
+    /// Replay tasks aborted because the client's `last_seq` is outside the retention window.
+    pub replay_window_exceeded_total: GenericCounter<AtomicU64>,
+    /// Replay stopped early because the peer's outbound path closed during catch-up.
+    pub replay_aborted_peer_gone_total: GenericCounter<AtomicU64>,
+    /// Replay hit the per-stream cap (`MAX_REPLAY_MESSAGES`); client should full-resync.
+    pub replay_truncated_total: GenericCounter<AtomicU64>,
+    /// Number of active replay tasks at this moment.
+    pub replay_in_flight: GenericGauge<AtomicI64>,
 }
 
 impl Metrics {
@@ -133,6 +147,42 @@ impl Metrics {
         )
         .expect("metric registration failed");
 
+        let replay_success_total = prometheus::register_int_counter!(
+            "turbocable_replay_success_total",
+            "Replay tasks that completed without error"
+        )
+        .expect("metric registration failed");
+
+        let replay_failure_total = prometheus::register_int_counter!(
+            "turbocable_replay_failure_total",
+            "Replay tasks that failed with a transient JetStream error"
+        )
+        .expect("metric registration failed");
+
+        let replay_window_exceeded_total = prometheus::register_int_counter!(
+            "turbocable_replay_window_exceeded_total",
+            "Replay tasks aborted due to client last_seq outside the retention window"
+        )
+        .expect("metric registration failed");
+
+        let replay_aborted_peer_gone_total = prometheus::register_int_counter!(
+            "turbocable_replay_aborted_peer_gone_total",
+            "Replay tasks stopped because the WebSocket outbound channel closed mid-replay"
+        )
+        .expect("metric registration failed");
+
+        let replay_truncated_total = prometheus::register_int_counter!(
+            "turbocable_replay_truncated_total",
+            "Replay tasks that hit the per-stream message cap and required client resync"
+        )
+        .expect("metric registration failed");
+
+        let replay_in_flight = prometheus::register_int_gauge!(
+            "turbocable_replay_in_flight",
+            "Number of active replay tasks"
+        )
+        .expect("metric registration failed");
+
         Arc::new(Self {
             connections_active,
             connections_total,
@@ -147,6 +197,12 @@ impl Metrics {
             handshake_rejected_total,
             handshake_rejected_non_replay_capable_total,
             forced_reconnect_backpressure_total,
+            replay_success_total,
+            replay_failure_total,
+            replay_window_exceeded_total,
+            replay_aborted_peer_gone_total,
+            replay_truncated_total,
+            replay_in_flight,
         })
     }
 

@@ -44,6 +44,8 @@ pub async fn run(cfg: Config) {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    let replay_semaphore = Arc::new(tokio::sync::Semaphore::new(cfg.max_replay_concurrency));
+
     let state = AppState {
         registry: registry.clone(),
         limiter,
@@ -54,7 +56,9 @@ pub async fn run(cfg: Config) {
         metrics,
         shutdown_rx,
         ws_channel_capacity: cfg.ws_channel_capacity,
+        ws_replay_channel_capacity: cfg.ws_replay_channel_capacity,
         replay_enforcement: cfg.replay_enforcement,
+        replay_semaphore,
     };
 
     let app = Router::new()

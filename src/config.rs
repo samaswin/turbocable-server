@@ -58,11 +58,21 @@ pub struct Config {
     #[arg(long, env = "TURBOCABLE_MAX_CONN_PER_IP", default_value = "10")]
     pub max_connections_per_ip: u64,
 
-    /// Per-connection outbound channel capacity in message slots.
+    /// Per-connection outbound channel capacity in message slots (live fan-out path).
     /// Increasing this reduces drops under bursty load at the cost of more memory per connection.
     /// At 200 msg/s a value of 4096 provides ~20 s of buffer before back-pressure drops occur.
     #[arg(long, env = "TURBOCABLE_WS_CHANNEL_CAPACITY", default_value = "4096")]
     pub ws_channel_capacity: usize,
+
+    /// Capacity for the per-connection replay outbound queue (JetStream catch-up).
+    /// Isolated from the live fan-out channel so replay bursts do not exhaust the live buffer;
+    /// the outbound loop always drains replay before delivering live frames for ordering.
+    #[arg(
+        long,
+        env = "TURBOCABLE_WS_REPLAY_CHANNEL_CAPACITY",
+        default_value = "4096"
+    )]
+    pub ws_replay_channel_capacity: usize,
 
     /// Path to an RSA public key PEM file for JWT verification.
     #[arg(long, env = "TURBOCABLE_JWT_PUBLIC_KEY_PATH")]
@@ -89,6 +99,18 @@ pub struct Config {
     /// Fast rollback: set `REPLAY_ENFORCEMENT=compat` and restart.
     #[arg(long, env = "REPLAY_ENFORCEMENT", default_value = "compat")]
     pub replay_enforcement: ReplayEnforcement,
+
+    /// Maximum number of concurrent per-connection replay tasks on this gateway node.
+    ///
+    /// Excess replay requests queue (not dropped) until a slot is free.
+    /// Lower values reduce memory and scheduler pressure during reconnect storms at
+    /// the cost of delaying replays for connections beyond the cap.
+    #[arg(
+        long,
+        env = "TURBOCABLE_MAX_REPLAY_CONCURRENCY",
+        default_value = "1000"
+    )]
+    pub max_replay_concurrency: usize,
 }
 
 /// Generates a random node ID prefixed with `node_`.

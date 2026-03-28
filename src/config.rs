@@ -16,17 +16,24 @@ pub enum ReplayEnforcement {
     /// subscribe-before-hello connections.
     #[default]
     Compat,
-    /// Require hello before commands and `replay_v1` on hello for subscribe.
+    /// Phase B: require `hello` before any command. Subscribes without
+    /// `replay_v1` on hello are **allowed** with warning logs and a dedicated
+    /// metric so you can measure remaining legacy clients before Phase C.
     SoftEnforce,
-    /// Same behaviour as `soft_enforce` (promoted when Phase C gates pass).
+    /// Phase C: require `hello` first and reject subscribes unless the client
+    /// advertised `replay_v1` on hello.
     HardEnforce,
 }
 
 impl ReplayEnforcement {
-    /// Returns `true` when the enforcement mode rejects non-compliant clients
-    /// (i.e. anything stricter than `Compat`).
-    pub fn is_enforcing(self) -> bool {
+    /// `true` when the client must send `hello` before other frames are processed.
+    pub fn requires_hello_first(self) -> bool {
         matches!(self, Self::SoftEnforce | Self::HardEnforce)
+    }
+
+    /// `true` when subscribe without `replay_v1` must be rejected.
+    pub fn rejects_non_replay_subscribe(self) -> bool {
+        matches!(self, Self::HardEnforce)
     }
 }
 
@@ -93,8 +100,10 @@ pub struct Config {
     /// Controls hello ordering and `replay_v1` capability:
     /// - `compat` (default): allow subscribe-before-hello with a warning metric; allow
     ///   hello without `replay_v1`.
-    /// - `soft_enforce` / `hard_enforce`: reject commands before hello; require
-    ///   `capabilities: ["replay_v1"]` on hello or subscribe is rejected.
+    /// - `soft_enforce`: reject commands before hello; allow subscribe even without
+    ///   `replay_v1` (warning metric for migration).
+    /// - `hard_enforce`: reject commands before hello; reject subscribe if hello lacked
+    ///   `replay_v1`.
     ///
     /// Fast rollback: set `REPLAY_ENFORCEMENT=compat` and restart.
     #[arg(long, env = "REPLAY_ENFORCEMENT", default_value = "compat")]
@@ -116,4 +125,23 @@ pub struct Config {
 /// Generates a random node ID prefixed with `node_`.
 fn default_node_id() -> String {
     format!("node_{}", uuid::Uuid::new_v4().simple())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReplayEnforcement;
+
+    #[test]
+    fn requires_hello_first_only_outside_compat() {
+        assert!(!ReplayEnforcement::Compat.requires_hello_first());
+        assert!(ReplayEnforcement::SoftEnforce.requires_hello_first());
+        assert!(ReplayEnforcement::HardEnforce.requires_hello_first());
+    }
+
+    #[test]
+    fn rejects_non_replay_subscribe_only_in_hard() {
+        assert!(!ReplayEnforcement::Compat.rejects_non_replay_subscribe());
+        assert!(!ReplayEnforcement::SoftEnforce.rejects_non_replay_subscribe());
+        assert!(ReplayEnforcement::HardEnforce.rejects_non_replay_subscribe());
+    }
 }

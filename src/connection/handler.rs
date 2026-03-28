@@ -38,8 +38,10 @@ const OUTBOUND_REPLAY_BURST: usize = 512;
 ///
 /// Every connection starts in [`ConnectionState::AwaitingHello`].  The gateway
 /// transitions to [`ConnectionState::Active`] on receipt of a valid hello frame.
-/// In `Compat` enforcement mode a subscribe-before-hello also transitions to
-/// `Active` (with a warning metric); in stricter modes the command is rejected.
+/// In `Compat` mode a subscribe-before-hello also transitions to `Active` (with a
+/// warning metric). In `SoftEnforce` / `HardEnforce`, commands before `hello` are
+/// rejected. Non-`replay_v1` subscribes are allowed in `SoftEnforce` (warn metric)
+/// and rejected in `HardEnforce`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionState {
     /// Waiting for the client's hello frame.  Only hello frames are fully
@@ -519,7 +521,7 @@ async fn handle_client_frame(
         ClientFrame::Command(cmd) => {
             // Enforce handshake state before processing commands.
             if *conn_state == ConnectionState::AwaitingHello {
-                if state.replay_enforcement.is_enforcing() {
+                if state.replay_enforcement.requires_hello_first() {
                     // Reject the command — client must send hello first.
                     state.metrics.handshake_rejected_total.inc();
                     tracing::warn!(
@@ -564,7 +566,7 @@ async fn dispatch_command(
 ) {
     match cmd {
         ClientCommand::Subscribe { identifier } => {
-            if state.replay_enforcement.is_enforcing() && !replay_capable {
+            if state.replay_enforcement.rejects_non_replay_subscribe() && !replay_capable {
                 state
                     .metrics
                     .handshake_rejected_non_replay_capable_total
@@ -582,6 +584,18 @@ async fn dispatch_command(
                     let _ = ctx.live_tx.send(reject).await;
                 }
                 return;
+            }
+
+            if state.replay_enforcement == ReplayEnforcement::SoftEnforce && !replay_capable {
+                state
+                    .metrics
+                    .handshake_soft_non_replay_subscribe_allowed_total
+                    .inc();
+                tracing::warn!(
+                    ctx.conn_id,
+                    identifier,
+                    "subscribe allowed without replay_v1 (soft_enforce migration path)"
+                );
             }
 
             if !jwt::is_allowed(ctx.allowed_streams, &identifier) {
@@ -824,4 +838,474 @@ fn stream_key_from_identifier(identifier: &str) -> &str {
         }
     }
     identifier
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::limiter::ConnectionLimiter;
+    use crate::connection::registry::Registry;
+    use crate::metrics::Metrics;
+    use crate::protocol::json::JsonCodec;
+    use std::sync::OnceLock;
+
+    // Shared metrics instance — Prometheus registers names globally, so a single
+    // instance is reused across all tests in this module.
+    static TEST_METRICS: OnceLock<Arc<Metrics>> = OnceLock::new();
+
+    fn test_metrics() -> Arc<Metrics> {
+        TEST_METRICS.get_or_init(Metrics::new).clone()
+    }
+
+    fn make_state(enforcement: ReplayEnforcement) -> AppState {
+        let (_, shutdown_rx) = watch::channel(false);
+        AppState {
+            registry: Arc::new(Registry::new()),
+            limiter: Arc::new(ConnectionLimiter::new(100)),
+            ping_interval_secs: 30,
+            jwt_verifier: None,
+            nats_consumer: None,
+            presence: None,
+            metrics: test_metrics(),
+            shutdown_rx,
+            ws_channel_capacity: 64,
+            ws_replay_channel_capacity: 64,
+            replay_enforcement: enforcement,
+            replay_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
+        }
+    }
+
+    fn json_codec() -> Arc<dyn Codec> {
+        Arc::new(JsonCodec)
+    }
+
+    // --- Phase A: compat ---
+
+    #[tokio::test]
+    async fn compat_subscribe_before_hello_allows_with_warn_metric() {
+        let state = make_state(ReplayEnforcement::Compat);
+        let codec = json_codec();
+        let (live_tx, mut live_rx) = mpsc::channel::<Bytes>(64);
+        let (replay_tx, _replay_rx) = mpsc::channel::<Bytes>(64);
+        let (urgent_tx, _urgent_rx) = mpsc::channel::<Bytes>(1);
+        let ctx = ConnContext {
+            conn_id: 1,
+            codec: Arc::clone(&codec),
+            live_tx: &live_tx,
+            replay_tx: &replay_tx,
+            urgent_close_tx: &urgent_tx,
+            allowed_streams: &[String::from("*")],
+            user_id: None,
+        };
+
+        let before = state.metrics.handshake_legacy_warn_total.get() as u64;
+        let mut conn_state = ConnectionState::AwaitingHello;
+        let mut replay_capable = false;
+        let mut last_seq = None;
+        let mut heartbeats = std::collections::HashMap::new();
+
+        handle_client_frame(
+            br#"{"command":"subscribe","identifier":"my_stream"}"#,
+            &ctx,
+            &state,
+            &mut conn_state,
+            &mut replay_capable,
+            &mut last_seq,
+            &mut heartbeats,
+        )
+        .await;
+
+        assert_eq!(conn_state, ConnectionState::Active, "should transition to Active");
+        assert_eq!(
+            state.metrics.handshake_legacy_warn_total.get() as u64,
+            before + 1,
+            "legacy warn counter should increment"
+        );
+        let msg = live_rx.try_recv().expect("confirm_subscription expected");
+        let val: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+        assert_eq!(val["type"], "confirm_subscription");
+        assert_eq!(val["identifier"], "my_stream");
+    }
+
+    // --- Phase B: soft_enforce ---
+
+    #[tokio::test]
+    async fn soft_enforce_subscribe_before_hello_rejects() {
+        let state = make_state(ReplayEnforcement::SoftEnforce);
+        let codec = json_codec();
+        let (live_tx, mut live_rx) = mpsc::channel::<Bytes>(64);
+        let (replay_tx, _replay_rx) = mpsc::channel::<Bytes>(64);
+        let (urgent_tx, _urgent_rx) = mpsc::channel::<Bytes>(1);
+        let ctx = ConnContext {
+            conn_id: 2,
+            codec: Arc::clone(&codec),
+            live_tx: &live_tx,
+            replay_tx: &replay_tx,
+            urgent_close_tx: &urgent_tx,
+            allowed_streams: &[String::from("*")],
+            user_id: None,
+        };
+
+        let before_rejected = state.metrics.handshake_rejected_total.get() as u64;
+        let mut conn_state = ConnectionState::AwaitingHello;
+        let mut replay_capable = false;
+        let mut last_seq = None;
+        let mut heartbeats = std::collections::HashMap::new();
+
+        handle_client_frame(
+            br#"{"command":"subscribe","identifier":"my_stream"}"#,
+            &ctx,
+            &state,
+            &mut conn_state,
+            &mut replay_capable,
+            &mut last_seq,
+            &mut heartbeats,
+        )
+        .await;
+
+        assert_eq!(
+            conn_state,
+            ConnectionState::AwaitingHello,
+            "should stay AwaitingHello"
+        );
+        assert!(
+            state.metrics.handshake_rejected_total.get() as u64 > before_rejected,
+            "rejected counter should increment"
+        );
+        let msg = live_rx.try_recv().expect("reject_subscription expected");
+        let val: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+        assert_eq!(val["type"], "reject_subscription");
+    }
+
+    #[tokio::test]
+    async fn soft_enforce_subscribe_without_replay_v1_allowed_with_warn_metric() {
+        let state = make_state(ReplayEnforcement::SoftEnforce);
+        let codec = json_codec();
+        let (live_tx, mut live_rx) = mpsc::channel::<Bytes>(64);
+        let (replay_tx, _replay_rx) = mpsc::channel::<Bytes>(64);
+        let (urgent_tx, _urgent_rx) = mpsc::channel::<Bytes>(1);
+        let ctx = ConnContext {
+            conn_id: 3,
+            codec: Arc::clone(&codec),
+            live_tx: &live_tx,
+            replay_tx: &replay_tx,
+            urgent_close_tx: &urgent_tx,
+            allowed_streams: &[String::from("*")],
+            user_id: None,
+        };
+
+        let before_soft = state
+            .metrics
+            .handshake_soft_non_replay_subscribe_allowed_total
+            .get() as u64;
+        let mut conn_state = ConnectionState::AwaitingHello;
+        let mut replay_capable = false;
+        let mut last_seq = None;
+        let mut heartbeats = std::collections::HashMap::new();
+
+        // hello without replay_v1
+        handle_client_frame(
+            br#"{"type":"hello"}"#,
+            &ctx,
+            &state,
+            &mut conn_state,
+            &mut replay_capable,
+            &mut last_seq,
+            &mut heartbeats,
+        )
+        .await;
+        assert_eq!(conn_state, ConnectionState::Active);
+        assert!(!replay_capable);
+
+        // subscribe — should be allowed with a warning metric
+        handle_client_frame(
+            br#"{"command":"subscribe","identifier":"my_stream"}"#,
+            &ctx,
+            &state,
+            &mut conn_state,
+            &mut replay_capable,
+            &mut last_seq,
+            &mut heartbeats,
+        )
+        .await;
+
+        assert_eq!(
+            state
+                .metrics
+                .handshake_soft_non_replay_subscribe_allowed_total
+                .get() as u64,
+            before_soft + 1,
+            "soft non-replay-subscribe counter should increment"
+        );
+        // Drain welcome if present; confirm must arrive.
+        let mut found_confirm = false;
+        while let Ok(msg) = live_rx.try_recv() {
+            let val: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+            if val["type"] == "confirm_subscription" {
+                found_confirm = true;
+            }
+        }
+        assert!(found_confirm, "confirm_subscription expected");
+    }
+
+    // --- Phase C: hard_enforce ---
+
+    #[tokio::test]
+    async fn hard_enforce_subscribe_before_hello_rejects() {
+        let state = make_state(ReplayEnforcement::HardEnforce);
+        let codec = json_codec();
+        let (live_tx, mut live_rx) = mpsc::channel::<Bytes>(64);
+        let (replay_tx, _replay_rx) = mpsc::channel::<Bytes>(64);
+        let (urgent_tx, _urgent_rx) = mpsc::channel::<Bytes>(1);
+        let ctx = ConnContext {
+            conn_id: 4,
+            codec: Arc::clone(&codec),
+            live_tx: &live_tx,
+            replay_tx: &replay_tx,
+            urgent_close_tx: &urgent_tx,
+            allowed_streams: &[String::from("*")],
+            user_id: None,
+        };
+
+        let before_rejected = state.metrics.handshake_rejected_total.get() as u64;
+        let mut conn_state = ConnectionState::AwaitingHello;
+        let mut replay_capable = false;
+        let mut last_seq = None;
+        let mut heartbeats = std::collections::HashMap::new();
+
+        handle_client_frame(
+            br#"{"command":"subscribe","identifier":"my_stream"}"#,
+            &ctx,
+            &state,
+            &mut conn_state,
+            &mut replay_capable,
+            &mut last_seq,
+            &mut heartbeats,
+        )
+        .await;
+
+        assert_eq!(
+            conn_state,
+            ConnectionState::AwaitingHello,
+            "should stay AwaitingHello"
+        );
+        assert!(
+            state.metrics.handshake_rejected_total.get() as u64 > before_rejected
+        );
+        let msg = live_rx.try_recv().expect("reject_subscription expected");
+        let val: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+        assert_eq!(val["type"], "reject_subscription");
+    }
+
+    #[tokio::test]
+    async fn hard_enforce_subscribe_without_replay_v1_rejects() {
+        let state = make_state(ReplayEnforcement::HardEnforce);
+        let codec = json_codec();
+        let (live_tx, mut live_rx) = mpsc::channel::<Bytes>(64);
+        let (replay_tx, _replay_rx) = mpsc::channel::<Bytes>(64);
+        let (urgent_tx, _urgent_rx) = mpsc::channel::<Bytes>(1);
+        let ctx = ConnContext {
+            conn_id: 5,
+            codec: Arc::clone(&codec),
+            live_tx: &live_tx,
+            replay_tx: &replay_tx,
+            urgent_close_tx: &urgent_tx,
+            allowed_streams: &[String::from("*")],
+            user_id: None,
+        };
+
+        let before_non_replay = state
+            .metrics
+            .handshake_rejected_non_replay_capable_total
+            .get() as u64;
+        let mut conn_state = ConnectionState::AwaitingHello;
+        let mut replay_capable = false;
+        let mut last_seq = None;
+        let mut heartbeats = std::collections::HashMap::new();
+
+        // hello without replay_v1
+        handle_client_frame(
+            br#"{"type":"hello"}"#,
+            &ctx,
+            &state,
+            &mut conn_state,
+            &mut replay_capable,
+            &mut last_seq,
+            &mut heartbeats,
+        )
+        .await;
+        assert_eq!(conn_state, ConnectionState::Active);
+        assert!(!replay_capable);
+
+        // subscribe — must be rejected
+        handle_client_frame(
+            br#"{"command":"subscribe","identifier":"my_stream"}"#,
+            &ctx,
+            &state,
+            &mut conn_state,
+            &mut replay_capable,
+            &mut last_seq,
+            &mut heartbeats,
+        )
+        .await;
+
+        assert_eq!(
+            state
+                .metrics
+                .handshake_rejected_non_replay_capable_total
+                .get() as u64,
+            before_non_replay + 1,
+            "non-replay-capable reject counter should increment"
+        );
+        let mut found_reject = false;
+        while let Ok(msg) = live_rx.try_recv() {
+            let val: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+            if val["type"] == "reject_subscription" {
+                found_reject = true;
+            }
+        }
+        assert!(found_reject, "reject_subscription expected");
+    }
+
+    #[tokio::test]
+    async fn hard_enforce_subscribe_with_replay_v1_allowed() {
+        let state = make_state(ReplayEnforcement::HardEnforce);
+        let codec = json_codec();
+        let (live_tx, mut live_rx) = mpsc::channel::<Bytes>(64);
+        let (replay_tx, _replay_rx) = mpsc::channel::<Bytes>(64);
+        let (urgent_tx, _urgent_rx) = mpsc::channel::<Bytes>(1);
+        let ctx = ConnContext {
+            conn_id: 6,
+            codec: Arc::clone(&codec),
+            live_tx: &live_tx,
+            replay_tx: &replay_tx,
+            urgent_close_tx: &urgent_tx,
+            allowed_streams: &[String::from("*")],
+            user_id: None,
+        };
+
+        let mut conn_state = ConnectionState::AwaitingHello;
+        let mut replay_capable = false;
+        let mut last_seq = None;
+        let mut heartbeats = std::collections::HashMap::new();
+
+        // hello with replay_v1
+        handle_client_frame(
+            br#"{"type":"hello","capabilities":["replay_v1"]}"#,
+            &ctx,
+            &state,
+            &mut conn_state,
+            &mut replay_capable,
+            &mut last_seq,
+            &mut heartbeats,
+        )
+        .await;
+        assert_eq!(conn_state, ConnectionState::Active);
+        assert!(replay_capable);
+
+        // subscribe — must succeed
+        handle_client_frame(
+            br#"{"command":"subscribe","identifier":"my_stream"}"#,
+            &ctx,
+            &state,
+            &mut conn_state,
+            &mut replay_capable,
+            &mut last_seq,
+            &mut heartbeats,
+        )
+        .await;
+
+        let mut found_confirm = false;
+        while let Ok(msg) = live_rx.try_recv() {
+            let val: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+            if val["type"] == "confirm_subscription" {
+                found_confirm = true;
+            }
+        }
+        assert!(found_confirm, "confirm_subscription expected");
+    }
+
+    // --- Hello handling ---
+
+    #[tokio::test]
+    async fn hello_with_replay_v1_increments_ok_replay_capable_metric() {
+        let state = make_state(ReplayEnforcement::Compat);
+        let codec = json_codec();
+        let (live_tx, _live_rx) = mpsc::channel::<Bytes>(64);
+        let (replay_tx, _replay_rx) = mpsc::channel::<Bytes>(64);
+        let (urgent_tx, _urgent_rx) = mpsc::channel::<Bytes>(1);
+        let ctx = ConnContext {
+            conn_id: 7,
+            codec: Arc::clone(&codec),
+            live_tx: &live_tx,
+            replay_tx: &replay_tx,
+            urgent_close_tx: &urgent_tx,
+            allowed_streams: &[String::from("*")],
+            user_id: None,
+        };
+
+        let before = state.metrics.handshake_ok_replay_capable_total.get() as u64;
+        let mut conn_state = ConnectionState::AwaitingHello;
+        let mut replay_capable = false;
+        let mut last_seq = None;
+        let mut heartbeats = std::collections::HashMap::new();
+
+        handle_client_frame(
+            br#"{"type":"hello","capabilities":["replay_v1"]}"#,
+            &ctx,
+            &state,
+            &mut conn_state,
+            &mut replay_capable,
+            &mut last_seq,
+            &mut heartbeats,
+        )
+        .await;
+
+        assert_eq!(conn_state, ConnectionState::Active);
+        assert!(replay_capable);
+        assert!(
+            state.metrics.handshake_ok_replay_capable_total.get() as u64 > before
+        );
+    }
+
+    #[tokio::test]
+    async fn hello_without_replay_v1_increments_ok_legacy_metric() {
+        let state = make_state(ReplayEnforcement::Compat);
+        let codec = json_codec();
+        let (live_tx, _live_rx) = mpsc::channel::<Bytes>(64);
+        let (replay_tx, _replay_rx) = mpsc::channel::<Bytes>(64);
+        let (urgent_tx, _urgent_rx) = mpsc::channel::<Bytes>(1);
+        let ctx = ConnContext {
+            conn_id: 8,
+            codec: Arc::clone(&codec),
+            live_tx: &live_tx,
+            replay_tx: &replay_tx,
+            urgent_close_tx: &urgent_tx,
+            allowed_streams: &[String::from("*")],
+            user_id: None,
+        };
+
+        let before = state.metrics.handshake_ok_legacy_total.get() as u64;
+        let mut conn_state = ConnectionState::AwaitingHello;
+        let mut replay_capable = false;
+        let mut last_seq = None;
+        let mut heartbeats = std::collections::HashMap::new();
+
+        handle_client_frame(
+            br#"{"type":"hello"}"#,
+            &ctx,
+            &state,
+            &mut conn_state,
+            &mut replay_capable,
+            &mut last_seq,
+            &mut heartbeats,
+        )
+        .await;
+
+        assert_eq!(conn_state, ConnectionState::Active);
+        assert!(!replay_capable);
+        assert!(
+            state.metrics.handshake_ok_legacy_total.get() as u64 > before
+        );
+    }
 }

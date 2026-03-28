@@ -77,6 +77,10 @@ pub async fn run(cfg: Config) {
         .local_addr()
         .expect("listener must have a local address");
     tracing::info!("listening on {local_addr} (SO_REUSEPORT enabled)");
+    tracing::info!(
+        replay_enforcement = ?cfg.replay_enforcement,
+        "replay enforcement phase"
+    );
 
     axum::serve(
         listener,

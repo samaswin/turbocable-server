@@ -21,6 +21,10 @@ All options can be set via CLI flags or environment variables:
 | `--jwt-public-key-path` | `TURBOCABLE_JWT_PUBLIC_KEY_PATH` | _(none)_ | Path to RSA public key PEM for JWT auth |
 | `--max-ack-pending` | `TURBOCABLE_MAX_ACK_PENDING` | `10000` | Max unacknowledged NATS JetStream messages (back-pressure) |
 | `--nats-stream-replicas` | `TURBOCABLE_NATS_STREAM_REPLICAS` | `1` | JetStream stream replica count (use `3` in production) |
+| `--replay-enforcement` | `REPLAY_ENFORCEMENT` | `compat` | Handshake rollout: `compat` (legacy), `soft_enforce` (hello required; subscribes without `replay_v1` allowed with warning metric), `hard_enforce` (reject non-replay subscribes). Rollback: set `compat` and restart. |
+| `--ws-channel-capacity` | `TURBOCABLE_WS_CHANNEL_CAPACITY` | `4096` | Per-connection live fan-out channel depth |
+| `--ws-replay-channel-capacity` | `TURBOCABLE_WS_REPLAY_CHANNEL_CAPACITY` | `4096` | Per-connection replay queue depth (drained before live) |
+| `--max-replay-concurrency` | `TURBOCABLE_MAX_REPLAY_CONCURRENCY` | `1000` | Max concurrent JetStream replay tasks per node |
 
 Logging uses the standard `RUST_LOG` environment variable (for example `RUST_LOG=info` or `debug`). There is no dedicated CLI flag for log level.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_full_test_plan.sh — Automated end-to-end validation (see docs/load-testing-1m.md).
 #
-# Runs (in order): health check → reconnect/replay (k6) → crash recovery → load (k6 + tc-publish).
+# Runs (in order): health check → reconnect/replay (k6) → optional backpressure k6 → crash recovery → load (k6 + tc-publish).
 # Designed for Linux and WSL2 with bash; uses conservative defaults so a full run finishes
 # without exhausting file descriptors on a laptop.
 #
@@ -19,7 +19,8 @@
 #
 # Environment overrides (optional):
 #   GATEWAY_PORT, NATS_URL, MAX_CONN_PER_IP, TARGET_LOAD, RAMP_DURATION, DURATION,
-#   LATENCY_P99_MS, PUBLISH_RATE, NO_BUILD=1, BENCH_METRICS_MD (override metrics log path)
+#   LATENCY_P95_MS, LATENCY_P99_MS, PUBLISH_RATE, NO_BUILD=1, BENCH_METRICS_MD (override metrics log path)
+#   WITH_BACKPRESSURE=1 or --with-backpressure — after reconnect, run backpressure_eviction_test.js (mixed fast/slow VUs)
 
 set -euo pipefail
 
@@ -38,7 +39,8 @@ MAX_CONN_PER_IP="${MAX_CONN_PER_IP:-}"          # computed after --target is par
 TARGET_LOAD="${TARGET_LOAD:-1000}"
 RAMP_DURATION="${RAMP_DURATION:-1m}"
 DURATION="${DURATION:-5m}"
-LATENCY_P99_MS="${LATENCY_P99_MS:-50}"
+LATENCY_P95_MS="${LATENCY_P95_MS:-50}"
+LATENCY_P99_MS="${LATENCY_P99_MS:-75}"
 PUBLISH_RATE="${PUBLISH_RATE:-500}"
 
 QUICK=0
@@ -46,6 +48,7 @@ SKIP_CRASH=0
 SKIP_RECONNECT=0
 SKIP_LOAD=0
 WITH_BENCH=0
+WITH_BACKPRESSURE="${WITH_BACKPRESSURE:-0}"
 NO_BUILD="${NO_BUILD:-0}"
 RP_PID=""
 TARGET_LOAD_CLI=0
@@ -54,18 +57,20 @@ usage() {
     cat <<EOF
 run_full_test_plan.sh — automated validation on WSL/Linux (see docs/load-testing-1m.md).
 
-Order: health → reconnect/replay (k6) → crash recovery → sustained load (k6 + tc-publish).
+Order: health → reconnect/replay (k6) → optional backpressure k6 → crash recovery → sustained load (k6 + tc-publish).
 
 Prerequisites: cargo, k6, curl, python3; nats-server or NATS on 4222; nats CLI for crash test (or --skip-crash).
 
 Environment: GATEWAY_PORT, NATS_URL, MAX_CONN_PER_IP, TARGET_LOAD, RAMP_DURATION, DURATION,
-LATENCY_P99_MS, PUBLISH_RATE, NO_BUILD=1, BENCH_METRICS_MD
+LATENCY_P95_MS, LATENCY_P99_MS, PUBLISH_RATE, NO_BUILD=1, BENCH_METRICS_MD, WITH_BACKPRESSURE=1,
+BP_TARGET, BP_SLOW_VUS, BP_PHASE1, BP_GAP, BP_PHASE2, BP_SLOW_SLEEP, BP_PUBLISH_RATE, REQUIRE_BACKPRESSURE_EVICT
 
 Options:
   --quick              Shorter reconnect + smaller load (faster on WSL); skips crash recovery if nats CLI missing
   --skip-crash         Skip crash recovery
   --skip-reconnect     Skip reconnect / replay (k6)
   --skip-load          Skip sustained load (k6 + tc-publish)
+  --with-backpressure  After reconnect: k6 backpressure_eviction_test (mixed VUs; see docs/load-testing-1m.md)
   --with-bench         After load: cargo bench --bench registry_bench
   --no-build           Do not run cargo build (binaries must exist)
   --target N           Concurrent connections for sustained load (default: ${TARGET_LOAD})
@@ -80,6 +85,7 @@ while [[ $# -gt 0 ]]; do
         --skip-reconnect) SKIP_RECONNECT=1; shift ;;
         --skip-load) SKIP_LOAD=1; shift ;;
         --with-bench) WITH_BENCH=1; shift ;;
+        --with-backpressure) WITH_BACKPRESSURE=1; shift ;;
         --no-build) NO_BUILD=1; shift ;;
         --target)
             TARGET_LOAD="$2"
@@ -110,17 +116,36 @@ if [[ "$QUICK" -eq 1 ]]; then
     RECONNECT_GAP=3
     RECONNECT_PHASE2=25
     PUBLISH_RATE=5
+    _BP_TARGET=12
+    _BP_SLOW_VUS=4
+    _BP_PHASE1=20
+    _BP_GAP=2
+    _BP_PHASE2=25
+    _BP_SLOW_SLEEP=0.02
 else
     RECONNECT_VUS=100
     RECONNECT_PHASE1=30
     RECONNECT_GAP=5
     RECONNECT_PHASE2=60
+    _BP_TARGET=24
+    _BP_SLOW_VUS=8
+    _BP_PHASE1=45
+    _BP_GAP=3
+    _BP_PHASE2=60
+    _BP_SLOW_SLEEP=0.02
 fi
+BP_TARGET="${BP_TARGET:-$_BP_TARGET}"
+BP_SLOW_VUS="${BP_SLOW_VUS:-$_BP_SLOW_VUS}"
+BP_PHASE1="${BP_PHASE1:-$_BP_PHASE1}"
+BP_GAP="${BP_GAP:-$_BP_GAP}"
+BP_PHASE2="${BP_PHASE2:-$_BP_PHASE2}"
+BP_SLOW_SLEEP="${BP_SLOW_SLEEP:-$_BP_SLOW_SLEEP}"
 
 GATEWAY_BIN="$PROJECT_ROOT/target/release/turbocable-server"
 PUBLISH_BIN="$PROJECT_ROOT/target/release/tc-publish"
 K6_LOAD="$PROJECT_ROOT/bench/k6/load_1m.js"
 K6_RECONNECT="$PROJECT_ROOT/bench/k6/reconnect_test.js"
+K6_BACKPRESSURE="$PROJECT_ROOT/bench/k6/backpressure_eviction_test.js"
 GW_LOG=/tmp/tc-plan-gateway.log
 NATS_LOG=/tmp/tc-plan-nats.log
 
@@ -294,6 +319,8 @@ if [[ "$SKIP_RECONNECT" -eq 0 ]]; then
         -e "PHASE1_DURATION_S=$RECONNECT_PHASE1" \
         -e "RECONNECT_GAP_S=$RECONNECT_GAP" \
         -e "PHASE2_DURATION_S=$RECONNECT_PHASE2" \
+        -e "LATENCY_P95_MS=$LATENCY_P95_MS" \
+        -e "LATENCY_P99_MS=$LATENCY_P99_MS" \
         --summary-export="$K6_RECONNECT_SUMMARY"
     k6_rc=$?
     set -e
@@ -307,6 +334,52 @@ if [[ "$SKIP_RECONNECT" -eq 0 ]]; then
     log "Reconnect + replay finished."
 else
     log "Skipping reconnect / replay (--skip-reconnect)"
+fi
+
+# =============================================================================
+if [[ "$WITH_BACKPRESSURE" -eq 1 ]]; then
+    log "======== Backpressure eviction + replay (k6, mixed VUs) ========="
+    K6_BP_SUMMARY="$PROJECT_ROOT/bench/results/artifacts/k6-backpressure-$(date -u '+%Y%m%d-%H%M%S').json"
+    BP_PUBLISH_SECS=$((BP_PHASE1 + BP_GAP + BP_PHASE2 + 60))
+    if [[ "$QUICK" -eq 1 ]]; then
+        BP_PUBLISH_RATE="${BP_PUBLISH_RATE:-80}"
+    else
+        BP_PUBLISH_RATE="${BP_PUBLISH_RATE:-200}"
+    fi
+    log "Starting tc-publish (${BP_PUBLISH_RATE} msg/s, ${BP_PUBLISH_SECS}s) for backpressure scenario..."
+    "$PUBLISH_BIN" \
+        --nats-url "$NATS_URL" \
+        --stream bench \
+        --rate "$BP_PUBLISH_RATE" \
+        --duration "$BP_PUBLISH_SECS" \
+        --quiet &
+    RP_PID=$!
+    sleep 2
+    mkdir -p "$PROJECT_ROOT/bench/results/artifacts"
+    bp_start="$(date +%s)"
+    set +e
+    k6 run "$K6_BACKPRESSURE" \
+        -e "TARGET=$BP_TARGET" \
+        -e "SLOW_VUS=$BP_SLOW_VUS" \
+        -e "SLOW_SLEEP_S=$BP_SLOW_SLEEP" \
+        -e "GATEWAY_WSS_URL=$GATEWAY_WS" \
+        -e "PHASE1_DURATION_S=$BP_PHASE1" \
+        -e "RECONNECT_GAP_S=$BP_GAP" \
+        -e "PHASE2_DURATION_S=$BP_PHASE2" \
+        -e "LATENCY_P95_MS=$LATENCY_P95_MS" \
+        -e "LATENCY_P99_MS=$LATENCY_P99_MS" \
+        ${REQUIRE_BACKPRESSURE_EVICT:+-e "REQUIRE_BACKPRESSURE_EVICT=$REQUIRE_BACKPRESSURE_EVICT"} \
+        --summary-export="$K6_BP_SUMMARY"
+    bp_rc=$?
+    set -e
+    bp_end="$(date +%s)"
+    bp_wall=$((bp_end - bp_start))
+    kill "$RP_PID" 2>/dev/null || true
+    wait "$RP_PID" 2>/dev/null || true
+    RP_PID=""
+    [[ "$bp_rc" -eq 0 ]] || die "Backpressure k6 run failed (exit $bp_rc)"
+    bench_metrics_append "$PROJECT_ROOT" "Backpressure + replay (k6)" "$bp_wall" "$K6_BP_SUMMARY" "$BP_PUBLISH_RATE" "$BP_PUBLISH_SECS"
+    log "Backpressure scenario finished."
 fi
 
 # =============================================================================
@@ -330,6 +403,7 @@ if [[ "$SKIP_LOAD" -eq 0 ]]; then
     export NATS_URL
     export RAMP_DURATION
     export DURATION
+    export LATENCY_P95_MS
     export LATENCY_P99_MS
     export PUBLISH_RATE
     export MEMORY_PROFILE=false

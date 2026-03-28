@@ -87,7 +87,8 @@ r, d = sys.argv[1], sys.argv[2]
 print(secs(r) + secs(d) + 120)
 " "$RAMP_DURATION" "$DURATION")"
 fi
-LATENCY_P99_MS="${LATENCY_P99_MS:-50}"
+LATENCY_P95_MS="${LATENCY_P95_MS:-50}"
+LATENCY_P99_MS="${LATENCY_P99_MS:-75}"
 
 # --- Purge NATS stream ---
 # A fresh consumer uses DeliverPolicy::All (needed for reconnect replay), so if
@@ -138,6 +139,7 @@ k6 run "$K6_SCRIPT" \
     -e RAMP_DURATION="$RAMP_DURATION" \
     -e DURATION="$DURATION" \
     -e PROTOCOL="$PROTOCOL" \
+    -e "LATENCY_P95_MS=$LATENCY_P95_MS" \
     -e "LATENCY_P99_MS=$LATENCY_P99_MS" \
     --summary-export="$K6_LOAD_SUMMARY"
 k6_rc=$?

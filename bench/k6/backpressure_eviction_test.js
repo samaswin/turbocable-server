@@ -26,8 +26,11 @@
  *   TARGET, GATEWAY_WSS_URL, CHANNEL, STREAM, JWT_TOKEN — same as reconnect_test.js
  *   PHASE1_DURATION_S, RECONNECT_GAP_S, PHASE2_DURATION_S
  *   SLOW_SLEEP_S           Extra delay per data message in phase 1 (seconds; default 0)
+ *   SLOW_VUS               Number of VUs (by id 1..SLOW_VUS) that apply SLOW_SLEEP_S;
+ *                          remaining VUs drain at full speed (mixed workload). Default: TARGET (all slow).
  *   REQUIRE_BACKPRESSURE_EVICT  If "1", fail unless at least one disconnect with
- *                          backpressure reason is observed in phase 1
+ *                          backpressure reason is observed in phase 1 (cluster-wide: use shared metric).
+ *   LATENCY_P95_MS / LATENCY_P99_MS — live fan-out thresholds (defaults 50 / 75)
  */
 
 import ws from 'k6/ws';
@@ -43,7 +46,12 @@ const RECONNECT_GAP_S = parseInt(__ENV.RECONNECT_GAP_S || '3');
 const PHASE2_DURATION_S = parseInt(__ENV.PHASE2_DURATION_S || '60');
 const JWT_TOKEN = __ENV.JWT_TOKEN || '';
 const SLOW_SLEEP_S = parseFloat(__ENV.SLOW_SLEEP_S || '0');
+const SLOW_VUS = parseInt(__ENV.SLOW_VUS || String(TARGET), 10);
 const REQUIRE_BP = __ENV.REQUIRE_BACKPRESSURE_EVICT === '1';
+const LATENCY_P95_MS = parseInt(__ENV.LATENCY_P95_MS || '50', 10);
+const LATENCY_P99_MS = parseInt(__ENV.LATENCY_P99_MS || '75', 10);
+
+const isSlowVu = __VU <= SLOW_VUS;
 
 const tcFanoutLatencyMs = new Trend('tc_fanout_latency_ms', true);
 const tcMessagesReceived = new Counter('tc_messages_received');
@@ -55,6 +63,8 @@ const tcReconnectSuccess = new Rate('tc_reconnect_success');
 const tcActiveConns = new Gauge('tc_active_connections');
 /** Server disconnect frames with backpressure reason (recoverable eviction). */
 const tcBackpressureDisconnects = new Counter('tc_backpressure_disconnects');
+/** ms from phase-2 open to first data message after eviction/reconnect path. */
+const tcPostReconnectFirstDeliveryMs = new Trend('tc_post_reconnect_first_delivery_ms', true);
 
 const MAX_DURATION_S = PHASE1_DURATION_S + RECONNECT_GAP_S + PHASE2_DURATION_S + 30;
 
@@ -63,6 +73,8 @@ const thresholds = {
   tc_connect_success: ['rate>0.99'],
   tc_reconnect_success: ['rate>0.99'],
   tc_connection_errors: ['count<10'],
+  tc_fanout_latency_ms: [`p(95)<${LATENCY_P95_MS}`, `p(99)<${LATENCY_P99_MS}`],
+  tc_post_reconnect_first_delivery_ms: ['p(95)<2000'],
 };
 if (REQUIRE_BP) {
   thresholds.tc_backpressure_disconnects = ['count>=1'];
@@ -81,6 +93,18 @@ export const options = {
 };
 
 const identifier = JSON.stringify({ channel: CHANNEL, stream: STREAM });
+
+function messageSeq(msg) {
+  if (msg.seq !== undefined) {
+    const n = Number(msg.seq);
+    return Number.isNaN(n) ? undefined : n;
+  }
+  if (msg.message && msg.message.seq !== undefined) {
+    const n = Number(msg.message.seq);
+    return Number.isNaN(n) ? undefined : n;
+  }
+  return undefined;
+}
 
 export default function () {
   const headers = {};
@@ -104,7 +128,7 @@ export default function () {
     });
 
     socket.on('message', (raw) => {
-      if (SLOW_SLEEP_S > 0) {
+      if (isSlowVu && SLOW_SLEEP_S > 0) {
         sleep(SLOW_SLEEP_S);
       }
       let msg;
@@ -127,15 +151,15 @@ export default function () {
         return;
       }
 
-      if (msg.identifier === identifier && msg.message && msg.message.seq !== undefined) {
+      const seq = messageSeq(msg);
+      if (msg.identifier === identifier && msg.message && seq !== undefined) {
         tcMessagesReceived.add(1);
-        if (msg.message.sent_at !== undefined) {
+        if (msg.replayed !== true && msg.message.sent_at !== undefined) {
           const latency = Date.now() - Number(msg.message.sent_at);
           if (latency >= 0 && latency < 30_000) {
             tcFanoutLatencyMs.add(latency);
           }
         }
-        const seq = Number(msg.message.seq);
         if (lastSeq >= 0 && seq !== lastSeq + 1) {
           tcSequenceGaps.add(Math.max(0, seq - lastSeq - 1));
         }
@@ -169,12 +193,15 @@ export default function () {
 
   let expectedSeq = lastSeq >= 0 ? lastSeq + 1 : -1;
   let subscribeConfirmed = false;
+  let phase2OpenedAt = 0;
+  let recordedFirstDelivery = false;
 
   const res2 = ws.connect(URL, { headers, subprotocols: ['actioncable-v1-json'] }, (socket) => {
     tcActiveConns.add(1);
 
     socket.on('open', () => {
       tcReconnectSuccess.add(true);
+      phase2OpenedAt = Date.now();
       if (lastSeq >= 0) {
         socket.send(
           JSON.stringify({
@@ -201,10 +228,14 @@ export default function () {
         subscribeConfirmed = true;
         return;
       }
-      if (msg.identifier === identifier && msg.message && msg.message.seq !== undefined) {
+      const seq = messageSeq(msg);
+      if (msg.identifier === identifier && msg.message && seq !== undefined) {
         tcMessagesReceived.add(1);
-        const seq = Number(msg.message.seq);
-        const isReplayed = msg.message.replayed === true;
+        if (phase2OpenedAt > 0 && !recordedFirstDelivery) {
+          recordedFirstDelivery = true;
+          tcPostReconnectFirstDeliveryMs.add(Date.now() - phase2OpenedAt);
+        }
+        const isReplayed = msg.replayed === true;
         if (isReplayed) {
           tcReplayedMessages.add(1);
         } else if (msg.message.sent_at !== undefined) {

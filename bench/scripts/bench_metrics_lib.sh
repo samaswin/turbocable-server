@@ -110,9 +110,17 @@ tg = counter("tc_sequence_gaps")
 if tg is not None:
     print(f"| **Sequence gaps** | {tg} |")
 
+tbd = counter("tc_backpressure_disconnects")
+if tbd is not None:
+    print(f"| **Backpressure disconnects (k6)** | {tbd} |")
+
 lat = trend_line("tc_fanout_latency_ms")
 if lat:
     print(f"| **Fan-out receive latency** | {lat} |")
+
+recv1 = trend_line("tc_post_reconnect_first_delivery_ms")
+if recv1:
+    print(f"| **Post-reconnect first delivery** | {recv1} |")
 PY
         elif [[ -n "$k6_json" ]]; then
             echo "| **k6 summary JSON** | missing file \`$k6_json\` |"

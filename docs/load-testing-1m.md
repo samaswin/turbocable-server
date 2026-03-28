@@ -36,6 +36,20 @@ Phase minimums (if rolling out enforcement):
 - **Phase B (soft enforce)**: run at >= 600k sustained; pass all numeric gates; measure and bound non-compliant client rejects.
 - **Phase C (hard enforce)**: run at full 1M sustained; pass all numeric gates for two consecutive runs; validate rollback switch with a controlled drill.
 
+### k6 benchmark report (deterministic pass/fail)
+
+k6 scripts enforce the same ideas as the gates above via **thresholds** (a failed threshold fails the run with a non-zero exit code). Use this table when reading CI or `bench/results/benchmark_metrics.md` alongside raw `bench/results/artifacts/k6-*.json`.
+
+| Script | Reliability | Latency / recovery |
+|--------|-------------|-------------------|
+| `load_1m.js` | `tc_sequence_gaps` **count == 0**; `tc_connect_success` **rate > 0.99**; `tc_connection_errors` **count < 100** | `tc_fanout_latency_ms`: **p(95) < LATENCY_P95_MS** (default **50**), **p(99) < LATENCY_P99_MS** (default **75**). Tighten for single-node baseline, e.g. `LATENCY_P99_MS=30`. |
+| `reconnect_test.js` | Same sequence + connect/reconnect rates as documented below | Live fan-out: same **p95/p99** defaults as load. **Post-reconnect first data**: `tc_post_reconnect_first_delivery_ms` **p(95) < 2000** ms (recovery gate probe). |
+| `backpressure_eviction_test.js` | Same as reconnect for gaps + connect rates; optional **`REQUIRE_BACKPRESSURE_EVICT=1`** adds **`tc_backpressure_disconnects` count >= 1** (cluster-wide counter) | Same fan-out p95/p99 defaults; same **post-reconnect first delivery** p95 < 2000 ms. |
+
+**Backpressure safety gate (Prometheus, not k6):** `turbocable_forced_reconnect_backpressure_total` rate vs active connections — see `docs/reliability-replay-plan.md` (<= 1.0% per minute over 5 minutes). k6’s `tc_backpressure_disconnects` is a client-side witness when eviction occurs.
+
+**Mixed workload:** `backpressure_eviction_test.js` uses **`SLOW_VUS`** (default = `TARGET`, all slow) so only VUs `1..SLOW_VUS` apply **`SLOW_SLEEP_S`**; the rest consume at full speed, stressing fan-out while a subset falls behind.
+
 ---
 
 ## Prerequisites
@@ -171,18 +185,21 @@ Work through these in order; do not jump straight to 1M on untuned hardware.
 
 ## Automated full plan (WSL / Linux)
 
-From the repo root, `run_full_test_plan.sh` runs in order: health check → reconnect/replay (k6) → crash recovery → sustained load (`run_single_node.sh`). Defaults are safe for **WSL** (1k connections, short ramp/sustain); use `--quick` for a faster smoke.
+From the repo root, `run_full_test_plan.sh` runs in order: health check → reconnect/replay (k6) → optional **backpressure + replay** k6 → crash recovery → sustained load (`run_single_node.sh`). Defaults are safe for **WSL** (1k connections, short ramp/sustain); use `--quick` for a faster smoke.
 
 **Requires:** `cargo`, `k6`, `curl`, `python3`; `nats-server` (or NATS already on `4222`); **`nats` CLI** for crash recovery (or `--skip-crash`). With `--quick`, if the `nats` CLI is missing, crash recovery is skipped automatically.
+
+Add **`--with-backpressure`** to run `bench/k6/backpressure_eviction_test.js` after the reconnect scenario (mixed fast/slow VUs; higher publish rate for that segment). To **require** at least one eviction disconnect in the run, set **`REQUIRE_BACKPRESSURE_EVICT=1`** (only after tuning gateway buffer + publish rate + `SLOW_SLEEP_S` so eviction is likely). Override segment sizes with **`BP_TARGET`**, **`BP_SLOW_VUS`**, **`BP_PHASE1`**, **`BP_GAP`**, **`BP_PHASE2`**, **`BP_SLOW_SLEEP`**, **`BP_PUBLISH_RATE`** in the environment when invoking the script (see `bench/scripts/run_full_test_plan.sh`).
 
 **NATS / JetStream:** Before crash recovery, the script runs `nats stream ls` against `NATS_URL` (default `nats://127.0.0.1:4222`). If you see “port 4222 open” but the check still fails, NATS is often running **without** JetStream — restart with `nats-server --jetstream`. For Docker, TLS, or auth, set `NATS_URL` (for example `tls://…` or `nats://user:pass@host:4222`). To ignore this step, use `--skip-crash`.
 
 ```bash
-bash bench/scripts/run_full_test_plan.sh               # full WSL-friendly run
-bash bench/scripts/run_full_test_plan.sh --quick       # shorter; skips crash if `nats` CLI missing
-bash bench/scripts/run_full_test_plan.sh --skip-crash  # no `nats` CLI
-bash bench/scripts/run_full_test_plan.sh --target 2000 # override load VUs
-bash bench/scripts/run_full_test_plan.sh --no-build    # use existing release binaries
+bash bench/scripts/run_full_test_plan.sh                      # full WSL-friendly run
+bash bench/scripts/run_full_test_plan.sh --quick                # shorter; skips crash if `nats` CLI missing
+bash bench/scripts/run_full_test_plan.sh --with-backpressure    # adds backpressure k6 after reconnect
+bash bench/scripts/run_full_test_plan.sh --skip-crash           # no `nats` CLI
+bash bench/scripts/run_full_test_plan.sh --target 2000        # override load VUs
+bash bench/scripts/run_full_test_plan.sh --no-build           # use existing release binaries
 NO_BUILD=1 bash bench/scripts/run_full_test_plan.sh
 ```
 
@@ -227,8 +244,12 @@ Or run k6 directly:
 ```bash
 k6 run bench/k6/load_1m.js \
   -e TARGET=333000 \
-  -e GATEWAY_WSS_URL=ws://node1:9292/cable
+  -e GATEWAY_WSS_URL=ws://node1:9292/cable \
+  -e LATENCY_P95_MS=50 \
+  -e LATENCY_P99_MS=75
 ```
+
+For a stricter single-node latency baseline (e.g. p99 < 30 ms), set `LATENCY_P99_MS=30` (and optionally tighten `LATENCY_P95_MS`).
 
 ### Memory profiling
 
@@ -281,20 +302,23 @@ k6 run bench/k6/reconnect_test.js \
 
 - Each VU connects and subscribes, recording the last JetStream sequence seen.
 - After 30 s all VUs disconnect simultaneously.
-- After a 5 s offline gap, each VU reconnects and sends
-  `{"type":"hello","last_seq":"N"}` followed by a re-subscribe.
-- The server replays missed messages (`replayed: true`) before confirming the
+- Phase 1 sends `hello` with `replay_v1` before subscribe; after a 5 s offline gap, each VU reconnects and sends
+  `hello` with `last_seq` and `replay_v1`, then re-subscribes.
+- The server replays missed messages (top-level `replayed: true`) before confirming the
   subscription; live messages then resume.
 - `tc_sequence_gaps` must remain `0` — any gap means a message was never
   delivered even after replay.
 
-**Pass criteria:**
+**Pass criteria (k6 thresholds):**
 
 ```
-tc_sequence_gaps count     == 0    (no message loss after replay)
-tc_connect_success rate    > 0.99
-tc_reconnect_success rate  > 0.99
-tc_connection_errors count < 10
+tc_sequence_gaps count                        == 0    (no message loss after replay)
+tc_connect_success rate                       > 0.99
+tc_reconnect_success rate                     > 0.99
+tc_connection_errors count                    < 10
+tc_fanout_latency_ms   p(95) < LATENCY_P95_MS (default 50)
+tc_fanout_latency_ms   p(99) < LATENCY_P99_MS (default 75)
+tc_post_reconnect_first_delivery_ms p(95)    < 2000 ms
 ```
 
 **Custom metrics:**
@@ -302,16 +326,30 @@ tc_connection_errors count < 10
 | Metric | Description |
 |--------|-------------|
 | `tc_fanout_latency_ms` | p50/p95/p99 latency for live (non-replayed) messages |
+| `tc_post_reconnect_first_delivery_ms` | Time from phase-2 WebSocket open to first data message (replay or live) |
 | `tc_messages_received` | Total messages received (initial + replay + live) |
-| `tc_replayed_messages` | Messages delivered with `replayed=true` after reconnect |
+| `tc_replayed_messages` | Messages delivered with top-level `replayed: true` after reconnect |
 | `tc_sequence_gaps` | Missing seqs not covered by replay (must be 0) |
 | `tc_connect_success` | Rate of successful initial WS upgrades |
 | `tc_reconnect_success` | Rate of successful reconnect WS upgrades |
 | `tc_connection_errors` | Total connection errors across both segments |
 
-### Backpressure eviction (optional)
+### Backpressure eviction + replay (promotion scenario)
 
-`bench/k6/backpressure_eviction_test.js` sends `hello` with `replay_v1`, subscribes, and optionally adds `SLOW_SLEEP_S` delay per message so the gateway may fill the outbound channel and send `disconnect` with `backpressure_reconnect_required`. After a gap, it reconnects with `last_seq` and must keep `tc_sequence_gaps == 0`. Set `REQUIRE_BACKPRESSURE_EVICT=1` only after tuning `TURBOCABLE_WS_CHANNEL_CAPACITY`, publish rate, and `SLOW_SLEEP_S` so eviction actually occurs.
+`bench/k6/backpressure_eviction_test.js` sends `hello` with `replay_v1`, subscribes, and optionally adds **`SLOW_SLEEP_S`** per data message on **slow VUs only** (`SLOW_VUS` defaults to `TARGET` so every VU is slow; set e.g. `TARGET=24` and `SLOW_VUS=8` for a mixed pool). That pattern stresses live fan-out for fast clients while slow clients risk filling the per-socket outbound channel; the server should evict with `disconnect` / `backpressure_reconnect_required` (recoverable path, not silent drop). After reconnect with `last_seq`, **`tc_sequence_gaps` must stay 0**.
+
+k6 thresholds match the reconnect test for gaps, connect rates, live **p95/p99** fan-out (defaults 50 / 75 ms), and **post-reconnect first delivery p95 < 2 s**. Set **`REQUIRE_BACKPRESSURE_EVICT=1`** only after tuning **`TURBOCABLE_WS_CHANNEL_CAPACITY`**, publish rate, **`SLOW_SLEEP_S`**, and **`SLOW_VUS`** so at least one disconnect is observed (threshold: **`tc_backpressure_disconnects` count >= 1**).
+
+Example (tuned gateway with a small outbound buffer):
+
+```bash
+./target/release/tc-publish --stream bench --rate 200 --duration 600
+TARGET=20 SLOW_VUS=6 SLOW_SLEEP_S=0.03 k6 run bench/k6/backpressure_eviction_test.js
+# Stricter: require eviction
+REQUIRE_BACKPRESSURE_EVICT=1 TARGET=20 SLOW_VUS=6 SLOW_SLEEP_S=0.03 k6 run bench/k6/backpressure_eviction_test.js
+```
+
+**Burst / mixed steady + churn:** combine sustained `load_1m.js` or `run_single_node.sh` with a second publisher at a higher rate for short windows, or run `run_full_test_plan.sh --with-backpressure` so reconnect churn and backpressure scenarios run in one flow.
 
 ---
 
@@ -469,9 +507,23 @@ sysctl net.core.somaxconn
 | `turbocable_connections_total` | Total connections since startup |
 | `turbocable_connections_rejected_total` | Auth / rate-limit rejections |
 | `turbocable_messages_fanned_out_total` | Messages delivered to clients |
-| `turbocable_forced_reconnect_backpressure_total` | Connections evicted when outbound channel is full (client should reconnect and replay; not silent loss) |
 | `turbocable_fanout_duration_seconds` | Fan-out latency histogram |
 | `turbocable_nats_consumer_lag` | NATS pending message backlog |
+| `turbocable_forced_reconnect_backpressure_total` | Connections evicted due to full outbound channel (backpressure reconnect; not silent loss) |
+| `turbocable_handshake_ok_replay_capable_total` | Clients that completed hello handshake with `replay_v1` capability |
+| `turbocable_handshake_ok_legacy_total` | Clients that completed hello handshake without `replay_v1` |
+| `turbocable_handshake_legacy_warn_total` | Commands received before hello in compat mode (legacy client signal) |
+| `turbocable_handshake_rejected_total` | Commands rejected because client had not sent hello (enforce mode) |
+| `turbocable_handshake_soft_non_replay_subscribe_allowed_total` | Subscribe allowed in soft_enforce without `replay_v1` (legacy client signal) |
+| `turbocable_handshake_rejected_non_replay_capable_total` | Subscribe rejected in hard_enforce: client not `replay_v1`-capable |
+| `turbocable_replay_success_total` | Replay tasks that completed without error |
+| `turbocable_replay_failure_total` | Replay tasks that failed with a transient JetStream error |
+| `turbocable_replay_window_exceeded_total` | Replay tasks aborted: client `last_seq` outside the retention window |
+| `turbocable_replay_aborted_peer_gone_total` | Replay tasks stopped because the outbound channel closed mid-replay |
+| `turbocable_replay_truncated_total` | Replay tasks that hit the per-stream message cap (client resync required) |
+| `turbocable_replay_in_flight` | Active replay tasks (gauge) |
+| `turbocable_replay_catch_up_duration_seconds` | Wall-clock time for a replay task from start to completion (histogram) |
+| `turbocable_replay_first_delivery_seconds` | Time from replay start to first message enqueued in the outbound channel (histogram) |
 
 Scrape endpoint: `http://<gateway>:9292/metrics`
 

@@ -24,7 +24,8 @@
  *   STREAM            Stream to subscribe to                      (default: bench)
  *   RAMP_DURATION     Ramp-up time before sustained phase         (default: 2m)
  *   DURATION          Sustained hold duration                     (default: 10m)
- *   LATENCY_P99_MS    p99 threshold in ms (fail if exceeded)      (default: 50)
+ *   LATENCY_P95_MS    p95 threshold in ms (fail if exceeded)      (default: 50; promotion gate)
+ *   LATENCY_P99_MS    p99 threshold in ms (fail if exceeded)      (default: 75; promotion gate — tighten e.g. 30 for single-node baseline)
  *   JWT_TOKEN         Bearer token for JWT-authenticated gateways (default: "")
  *   PROTOCOL          "json" or "msgpack"                         (default: json)
  */
@@ -41,7 +42,8 @@ const CHANNEL        = __ENV.CHANNEL                 || 'BenchmarkChannel';
 const STREAM         = __ENV.STREAM                  || 'bench';
 const RAMP_DURATION  = __ENV.RAMP_DURATION           || '2m';
 const DURATION       = __ENV.DURATION                || '10m';
-const LATENCY_P99_MS = parseInt(__ENV.LATENCY_P99_MS || '50');
+const LATENCY_P95_MS = parseInt(__ENV.LATENCY_P95_MS || '50');
+const LATENCY_P99_MS = parseInt(__ENV.LATENCY_P99_MS || '75');
 const JWT_TOKEN      = __ENV.JWT_TOKEN               || '';
 const PROTOCOL       = __ENV.PROTOCOL                || 'json';  // "json" | "msgpack"
 
@@ -83,7 +85,10 @@ export const options = {
     },
   },
   thresholds: {
-    tc_fanout_latency_ms:  [`p(99)<${LATENCY_P99_MS}`],
+    tc_fanout_latency_ms: [
+      `p(95)<${LATENCY_P95_MS}`,
+      `p(99)<${LATENCY_P99_MS}`,
+    ],
     tc_sequence_gaps:      ['count==0'],
     tc_connect_success:    ['rate>0.99'],
     tc_connection_errors:  ['count<100'],
@@ -139,10 +144,17 @@ export default function () {
     socket.on('open', function () {
       tcConnectSuccess.add(true);
 
-      // On reconnect, tell the server the last sequence we received so it can
-      // replay any messages we missed while disconnected.
+      // Replay-capable handshake (required under hard enforcement; harmless in compat).
       if (isReconnect) {
-        socket.send(JSON.stringify({ type: 'hello', last_seq: String(lastSeq) }));
+        socket.send(
+          JSON.stringify({
+            type: 'hello',
+            last_seq: String(lastSeq),
+            capabilities: ['replay_v1'],
+          }),
+        );
+      } else {
+        socket.send(JSON.stringify({ type: 'hello', capabilities: ['replay_v1'] }));
       }
 
       socket.send(JSON.stringify({ command: 'subscribe', identifier }));
@@ -173,6 +185,12 @@ export default function () {
             // out of the live sequence and would inflate both metrics.
             const replayed = msg.replayed === true;
 
+            // Server frame carries JetStream sequence as a top-level `seq` field.
+            // Some publishers may also include `seq` inside the payload; prefer top-level.
+            const seqRaw =
+              msg.seq !== undefined ? msg.seq :
+              (msg.message && msg.message.seq !== undefined ? msg.message.seq : undefined);
+
             if (!replayed) {
               tcMessagesReceived.add(1);
 
@@ -184,23 +202,27 @@ export default function () {
                 }
               }
 
-              // Sequence tracking: detect any gaps (dropped messages).
-              // Only check against the previous live message — gaps caused by
-              // the reconnect window are already captured by this metric.
-              // Server frame carries JetStream sequence as a top-level `seq` field.
-              // Some publishers may also include `seq` inside the payload; prefer top-level.
-              const seqRaw =
-                msg.seq !== undefined ? msg.seq :
-                (msg.message && msg.message.seq !== undefined ? msg.message.seq : undefined);
+              // Gap detection for live messages only.  Replayed messages fill the
+              // window between disconnects — they must still advance lastSeq so that
+              // the first live message after replay does not look like a gap.
               if (seqRaw !== undefined) {
                 const seq = Number(seqRaw);
                 if (!Number.isNaN(seq)) {
                   if (lastSeq >= 0 && seq !== lastSeq + 1) {
                     tcSequenceGaps.add(Math.max(0, seq - lastSeq - 1));
                   }
-                  lastSeq = seq;
-                  vuLastSeq = seq;  // Persist for the next reconnect iteration.
                 }
+              }
+            }
+
+            // Always advance lastSeq — replayed messages fill the reconnect window
+            // and must be accounted for so that live messages following replay do
+            // not trigger false sequence gaps.
+            if (seqRaw !== undefined) {
+              const seq = Number(seqRaw);
+              if (!Number.isNaN(seq)) {
+                lastSeq = seq;
+                vuLastSeq = seq;  // Persist for the next reconnect iteration.
               }
             }
           }

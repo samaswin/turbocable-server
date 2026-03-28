@@ -37,12 +37,15 @@
  *   RECONNECT_GAP_S      Seconds offline before reconnecting  (default: 5)
  *   PHASE2_DURATION_S    Seconds to hold the reconnected conn (default: 60)
  *   JWT_TOKEN            Bearer token for JWT-auth gateways   (default: "")
+ *   LATENCY_P95_MS       Fan-out p95 threshold (live msgs)    (default: 50)
+ *   LATENCY_P99_MS       Fan-out p99 threshold (live msgs)    (default: 75)
  *
  * Pass criteria (thresholds):
  *   tc_sequence_gaps count == 0     — zero unreplayed message loss
  *   tc_connect_success rate > 0.99  — initial connections succeed
  *   tc_reconnect_success rate > 0.99 — reconnections succeed
  *   tc_connection_errors count < 10
+ *   tc_fanout_latency_ms p95 / p99  — within LATENCY_P95_MS / LATENCY_P99_MS (live only)
  */
 
 import ws from 'k6/ws';
@@ -59,6 +62,8 @@ const PHASE1_DURATION_S = parseInt(__ENV.PHASE1_DURATION_S || '30');
 const RECONNECT_GAP_S   = parseInt(__ENV.RECONNECT_GAP_S   || '5');
 const PHASE2_DURATION_S = parseInt(__ENV.PHASE2_DURATION_S || '60');
 const JWT_TOKEN         = __ENV.JWT_TOKEN                  || '';
+const LATENCY_P95_MS    = parseInt(__ENV.LATENCY_P95_MS    || '50');
+const LATENCY_P99_MS    = parseInt(__ENV.LATENCY_P99_MS    || '75');
 
 // ── Custom metrics ─────────────────────────────────────────────────────────────
 
@@ -83,6 +88,8 @@ const tcConnectSuccess    = new Rate('tc_connect_success');
 const tcReconnectSuccess  = new Rate('tc_reconnect_success');
 /** Current active connections (updated on open/close). */
 const tcActiveConns       = new Gauge('tc_active_connections');
+/** ms from phase-2 open to first subscription data (replay or live); recovery SLO probe. */
+const tcPostReconnectFirstDeliveryMs = new Trend('tc_post_reconnect_first_delivery_ms', true);
 
 // ── k6 scenario options ────────────────────────────────────────────────────────
 
@@ -103,10 +110,28 @@ export const options = {
     tc_connect_success:   ['rate>0.99'],
     tc_reconnect_success: ['rate>0.99'],
     tc_connection_errors: ['count<10'],
+    tc_fanout_latency_ms: [
+      `p(95)<${LATENCY_P95_MS}`,
+      `p(99)<${LATENCY_P99_MS}`,
+    ],
+    tc_post_reconnect_first_delivery_ms: ['p(95)<2000'],
   },
 };
 
 // ── VU default function ────────────────────────────────────────────────────────
+
+/** JetStream seq from server message (top-level preferred; payload fallback). */
+function messageSeq(msg) {
+  if (msg.seq !== undefined) {
+    const n = Number(msg.seq);
+    return Number.isNaN(n) ? undefined : n;
+  }
+  if (msg.message && msg.message.seq !== undefined) {
+    const n = Number(msg.message.seq);
+    return Number.isNaN(n) ? undefined : n;
+  }
+  return undefined;
+}
 
 export default function () {
   const identifier = JSON.stringify({ channel: CHANNEL, stream: STREAM });
@@ -126,6 +151,7 @@ export default function () {
 
     socket.on('open', () => {
       tcConnectSuccess.add(true);
+      socket.send(JSON.stringify({ type: 'hello', capabilities: ['replay_v1'] }));
       socket.send(JSON.stringify({ command: 'subscribe', identifier }));
     });
 
@@ -137,11 +163,12 @@ export default function () {
         return;
       }
 
-      if (msg.identifier === identifier && msg.message && msg.message.seq !== undefined) {
+      const seq = messageSeq(msg);
+      if (msg.identifier === identifier && msg.message && seq !== undefined) {
         tcMessagesReceived.add(1);
 
         // Latency measurement (phase 1 is always live).
-        if (msg.message.sent_at !== undefined) {
+        if (msg.replayed !== true && msg.message.sent_at !== undefined) {
           const latency = Date.now() - Number(msg.message.sent_at);
           if (latency >= 0 && latency < 30_000) {
             tcFanoutLatencyMs.add(latency);
@@ -149,7 +176,6 @@ export default function () {
         }
 
         // Phase 1 sequence gap detection (before any disconnect).
-        const seq = Number(msg.message.seq);
         if (lastSeq >= 0 && seq !== lastSeq + 1) {
           tcSequenceGaps.add(Math.max(0, seq - lastSeq - 1));
         }
@@ -198,16 +224,27 @@ export default function () {
 
   let expectedSeq       = lastSeq >= 0 ? lastSeq + 1 : -1;
   let subscribeConfirmed = false;
+  let phase2OpenedAt = 0;
+  let recordedFirstDelivery = false;
 
   const res2 = ws.connect(URL, { headers, subprotocols: ['actioncable-v1-json'] }, (socket) => {
     tcActiveConns.add(1);
 
     socket.on('open', () => {
       tcReconnectSuccess.add(true);
+      phase2OpenedAt = Date.now();
 
       // Announce last_seq so the server knows where to start replay from.
       if (lastSeq >= 0) {
-        socket.send(JSON.stringify({ type: 'hello', last_seq: String(lastSeq) }));
+        socket.send(
+          JSON.stringify({
+            type: 'hello',
+            last_seq: String(lastSeq),
+            capabilities: ['replay_v1'],
+          }),
+        );
+      } else {
+        socket.send(JSON.stringify({ type: 'hello', capabilities: ['replay_v1'] }));
       }
 
       // Re-subscribe — server will replay missed messages before confirming.
@@ -225,11 +262,16 @@ export default function () {
         return;
       }
 
-      if (msg.identifier === identifier && msg.message && msg.message.seq !== undefined) {
+      const seq = messageSeq(msg);
+      if (msg.identifier === identifier && msg.message && seq !== undefined) {
         tcMessagesReceived.add(1);
 
-        const seq       = Number(msg.message.seq);
-        const isReplayed = msg.message.replayed === true;
+        if (phase2OpenedAt > 0 && !recordedFirstDelivery) {
+          recordedFirstDelivery = true;
+          tcPostReconnectFirstDeliveryMs.add(Date.now() - phase2OpenedAt);
+        }
+
+        const isReplayed = msg.replayed === true;
 
         if (isReplayed) {
           tcReplayedMessages.add(1);

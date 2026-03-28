@@ -226,6 +226,8 @@ impl NatsConsumer {
 
         let mut count = 0usize;
         let mut prev_seq = last_seq;
+        let replay_start = Instant::now();
+        let mut first_delivery_elapsed: Option<Duration> = None;
 
         // Stream messages directly to the connection, yielding every REPLAY_BATCH_SIZE
         // messages so this task does not monopolise a Tokio worker thread.
@@ -273,7 +275,11 @@ impl NatsConsumer {
                                 return Ok(ReplayDelivery {
                                     delivered: count,
                                     peer_gone: true,
+                                    first_delivery_elapsed,
                                 });
+                            }
+                            if first_delivery_elapsed.is_none() {
+                                first_delivery_elapsed = Some(replay_start.elapsed());
                             }
                         }
                         Err(e) => {
@@ -331,6 +337,7 @@ impl NatsConsumer {
         Ok(ReplayDelivery {
             delivered: count,
             peer_gone: false,
+            first_delivery_elapsed,
         })
     }
 
@@ -423,25 +430,44 @@ impl NatsConsumer {
 
         let mut processed: u64 = 0;
 
-        while let Some(result) = messages.next().await {
-            let msg = result
-                .map_err(|e| GatewayError::JetStream(format!("consumer message error: {e}")))?;
+        // Time-based lag refresh so the gauge stays accurate at low publish rates.
+        let mut lag_interval = tokio::time::interval(Duration::from_secs(30));
+        lag_interval.tick().await; // consume the immediate tick; first update was done above
 
-            process_nats_message(&msg, registry, metrics);
+        loop {
+            tokio::select! {
+                biased;
 
-            // Fire the ack in a background task so the fanout loop is never
-            // stalled by the NATS round-trip (publish + flush per message).
-            tokio::spawn(async move {
-                if let Err(e) = msg.ack().await {
-                    tracing::warn!(error = %e, "NATS ack failed");
+                result = messages.next() => {
+                    let msg = match result {
+                        Some(Ok(msg)) => msg,
+                        Some(Err(e)) => {
+                            return Err(GatewayError::JetStream(format!("consumer message error: {e}")));
+                        }
+                        None => break,
+                    };
+
+                    process_nats_message(&msg, registry, metrics);
+
+                    // Fire the ack in a background task so the fanout loop is never
+                    // stalled by the NATS round-trip (publish + flush per message).
+                    tokio::spawn(async move {
+                        if let Err(e) = msg.ack().await {
+                            tracing::warn!(error = %e, "NATS ack failed");
+                        }
+                    });
+
+                    processed += 1;
+
+                    // Refresh consumer lag gauge every 10k messages.
+                    if processed.is_multiple_of(10_000) {
+                        update_consumer_lag(&mut consumer, metrics).await;
+                    }
                 }
-            });
 
-            processed += 1;
-
-            // Refresh consumer lag gauge every 10k messages.
-            if processed.is_multiple_of(10_000) {
-                update_consumer_lag(&mut consumer, metrics).await;
+                _ = lag_interval.tick() => {
+                    update_consumer_lag(&mut consumer, metrics).await;
+                }
             }
         }
 

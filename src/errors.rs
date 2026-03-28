@@ -1,5 +1,7 @@
 //! Typed error hierarchy for the gateway.
 
+use std::time::Duration;
+
 /// Error specific to client reconnect replay operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ReplayError {
@@ -35,6 +37,9 @@ pub struct ReplayDelivery {
     pub delivered: usize,
     /// `true` when the WebSocket peer closed the outbound path mid-replay.
     pub peer_gone: bool,
+    /// Elapsed time from replay start to first message successfully sent to the outbound channel.
+    /// `None` when no messages were delivered (e.g. stream caught up with nothing to replay).
+    pub first_delivery_elapsed: Option<Duration>,
 }
 
 /// All errors that can occur during gateway operation.

@@ -13,6 +13,9 @@ pub struct Metrics {
     pub connections_active: GenericGauge<AtomicI64>,
     /// Total WebSocket connections accepted since startup.
     pub connections_total: GenericCounter<AtomicU64>,
+    /// Client `hello` frames with `last_seq > 0` (resume after prior delivery).
+    /// Use `rate(...[5m])` as a reconnect-resume signal at the application layer.
+    pub client_reconnect_handshake_total: GenericCounter<AtomicU64>,
     /// Connections rejected due to auth failure or per-IP limit.
     pub connections_rejected: GenericCounter<AtomicU64>,
     /// Total WebSocket frames delivered to clients via fan-out.
@@ -56,6 +59,14 @@ pub struct Metrics {
     pub replay_truncated_total: GenericCounter<AtomicU64>,
     /// Number of active replay tasks at this moment.
     pub replay_in_flight: GenericGauge<AtomicI64>,
+
+    // --- Replay latency histograms (Phase 4) ---
+    /// Total wall-clock time from replay task start to last message delivered (or error).
+    /// Measures overall catch-up duration; p95/p99 must stay within the sub-50ms SLO budget.
+    pub replay_catch_up_duration_secs: Histogram,
+    /// Wall-clock time from replay task start to the first message successfully enqueued.
+    /// Serves as the server-side proxy for post-reconnect first-delivery latency.
+    pub replay_first_delivery_secs: Histogram,
 }
 
 impl Metrics {
@@ -72,6 +83,12 @@ impl Metrics {
         let connections_total = prometheus::register_int_counter!(
             "turbocable_connections_total",
             "Total WebSocket connections accepted since startup"
+        )
+        .expect("metric registration failed");
+
+        let client_reconnect_handshake_total = prometheus::register_int_counter!(
+            "turbocable_client_reconnect_handshake_total",
+            "Client hello frames with last_seq > 0 (resume / reconnect with delivery history)"
         )
         .expect("metric registration failed");
 
@@ -183,9 +200,26 @@ impl Metrics {
         )
         .expect("metric registration failed");
 
+        let replay_catch_up_duration_secs = prometheus::register_histogram!(HistogramOpts::new(
+            "turbocable_replay_catch_up_duration_seconds",
+            "Total wall-clock time for a replay task from start to completion"
+        )
+        .buckets(vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0,]))
+        .expect("metric registration failed");
+
+        let replay_first_delivery_secs = prometheus::register_histogram!(HistogramOpts::new(
+            "turbocable_replay_first_delivery_seconds",
+            "Time from replay start to first message enqueued in the outbound channel"
+        )
+        .buckets(vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0,
+        ]))
+        .expect("metric registration failed");
+
         Arc::new(Self {
             connections_active,
             connections_total,
+            client_reconnect_handshake_total,
             connections_rejected,
             messages_fanned_out,
             fanout_duration_secs,
@@ -203,6 +237,8 @@ impl Metrics {
             replay_aborted_peer_gone_total,
             replay_truncated_total,
             replay_in_flight,
+            replay_catch_up_duration_secs,
+            replay_first_delivery_secs,
         })
     }
 

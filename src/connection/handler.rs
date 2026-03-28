@@ -495,6 +495,10 @@ async fn handle_client_frame(
             *replay_capable = hello.is_replay_capable();
             *conn_state = ConnectionState::Active;
 
+            if hello.last_seq.is_some_and(|s| s > 0) {
+                state.metrics.client_reconnect_handshake_total.inc();
+            }
+
             if hello.is_replay_capable() {
                 state.metrics.handshake_ok_replay_capable_total.inc();
                 tracing::info!(
@@ -633,6 +637,7 @@ async fn dispatch_command(
                         Err(_) => return, // Semaphore closed (server shutting down).
                     };
 
+                    let replay_t0 = Instant::now();
                     task_metrics.replay_in_flight.inc();
                     let result = nats
                         .replay_since(
@@ -653,6 +658,14 @@ async fn dispatch_command(
                                 "replay aborted: peer outbound closed"
                             );
                             task_metrics.replay_aborted_peer_gone_total.inc();
+                            task_metrics
+                                .replay_catch_up_duration_secs
+                                .observe(replay_t0.elapsed().as_secs_f64());
+                            if let Some(fd) = d.first_delivery_elapsed {
+                                task_metrics
+                                    .replay_first_delivery_secs
+                                    .observe(fd.as_secs_f64());
+                            }
                         }
                         Ok(d) => {
                             tracing::info!(
@@ -662,6 +675,14 @@ async fn dispatch_command(
                                 "replay completed"
                             );
                             task_metrics.replay_success_total.inc();
+                            task_metrics
+                                .replay_catch_up_duration_secs
+                                .observe(replay_t0.elapsed().as_secs_f64());
+                            if let Some(fd) = d.first_delivery_elapsed {
+                                task_metrics
+                                    .replay_first_delivery_secs
+                                    .observe(fd.as_secs_f64());
+                            }
                             if let Ok(confirm) =
                                 task_codec.encode(&ServerMessage::ConfirmSubscription {
                                     identifier: task_stream,
@@ -683,6 +704,9 @@ async fn dispatch_command(
                                 "replay window exceeded: disconnecting for full resync"
                             );
                             task_metrics.replay_window_exceeded_total.inc();
+                            task_metrics
+                                .replay_catch_up_duration_secs
+                                .observe(replay_t0.elapsed().as_secs_f64());
                             if let Ok(disconnect) = task_codec.encode(&ServerMessage::Disconnect {
                                 reason: "replay_window_exceeded".to_string(),
                                 reconnect: Some(true),
@@ -703,6 +727,9 @@ async fn dispatch_command(
                                 "replay truncated at cap: disconnecting for continued catch-up"
                             );
                             task_metrics.replay_truncated_total.inc();
+                            task_metrics
+                                .replay_catch_up_duration_secs
+                                .observe(replay_t0.elapsed().as_secs_f64());
                             if let Ok(disconnect) = task_codec.encode(&ServerMessage::Disconnect {
                                 reason: "replay_truncated".to_string(),
                                 reconnect: Some(true),
@@ -718,6 +745,9 @@ async fn dispatch_command(
                                 "replay JetStream error"
                             );
                             task_metrics.replay_failure_total.inc();
+                            task_metrics
+                                .replay_catch_up_duration_secs
+                                .observe(replay_t0.elapsed().as_secs_f64());
                             // Still confirm so the client can continue with live messages.
                             if let Ok(confirm) =
                                 task_codec.encode(&ServerMessage::ConfirmSubscription {

@@ -915,7 +915,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(conn_state, ConnectionState::Active, "should transition to Active");
+        assert_eq!(
+            conn_state,
+            ConnectionState::Active,
+            "should transition to Active"
+        );
         assert_eq!(
             state.metrics.handshake_legacy_warn_total.get() as u64,
             before + 1,
@@ -1089,9 +1093,7 @@ mod tests {
             ConnectionState::AwaitingHello,
             "should stay AwaitingHello"
         );
-        assert!(
-            state.metrics.handshake_rejected_total.get() as u64 > before_rejected
-        );
+        assert!(state.metrics.handshake_rejected_total.get() as u64 > before_rejected);
         let msg = live_rx.try_recv().expect("reject_subscription expected");
         let val: serde_json::Value = serde_json::from_slice(&msg).unwrap();
         assert_eq!(val["type"], "reject_subscription");
@@ -1263,9 +1265,7 @@ mod tests {
 
         assert_eq!(conn_state, ConnectionState::Active);
         assert!(replay_capable);
-        assert!(
-            state.metrics.handshake_ok_replay_capable_total.get() as u64 > before
-        );
+        assert!(state.metrics.handshake_ok_replay_capable_total.get() as u64 > before);
     }
 
     #[tokio::test]
@@ -1304,8 +1304,6 @@ mod tests {
 
         assert_eq!(conn_state, ConnectionState::Active);
         assert!(!replay_capable);
-        assert!(
-            state.metrics.handshake_ok_legacy_total.get() as u64 > before
-        );
+        assert!(state.metrics.handshake_ok_legacy_total.get() as u64 > before);
     }
 }

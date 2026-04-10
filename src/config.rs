@@ -120,6 +120,56 @@ pub struct Config {
         default_value = "1000"
     )]
     pub max_replay_concurrency: usize,
+
+    /// Default per-stream rate limit in messages per second (0 = disabled).
+    ///
+    /// When non-zero, each stream gets an independent token-bucket limiter capped
+    /// at this rate.  Messages that exceed the limit are dropped before fan-out
+    /// and counted in `turbocable_stream_rate_limited_total`.
+    ///
+    /// Combine with `stream_rate_limit_burst` to allow short bursts above the
+    /// sustained rate.
+    #[arg(long, env = "TURBOCABLE_STREAM_RATE_LIMIT_RPS", default_value = "0")]
+    pub stream_rate_limit_rps: u64,
+
+    /// Default per-stream burst capacity in messages (0 = 2× rate).
+    ///
+    /// The bucket starts full, so a fresh stream can absorb up to `burst` messages
+    /// instantly before the sustained `rps` limit takes effect.
+    #[arg(long, env = "TURBOCABLE_STREAM_RATE_LIMIT_BURST", default_value = "0")]
+    pub stream_rate_limit_burst: u64,
+
+    /// Per-stream rate-limit overrides, semicolon-separated `"name=rps:burst"` pairs.
+    ///
+    /// Example: `"alerts=100:200;high_volume=5000:10000"`
+    ///
+    /// A stream listed here uses its own rps/burst regardless of the defaults.
+    /// Use `burst=0` in an override to apply the 2× default rule.
+    #[arg(long, env = "TURBOCABLE_STREAM_RATE_OVERRIDES", default_value = "")]
+    pub stream_rate_overrides: String,
+}
+
+impl Config {
+    /// Parses `stream_rate_overrides` into a `HashMap<stream_name, (rps, burst)>`.
+    ///
+    /// Invalid or malformed entries are silently skipped.  The expected format is
+    /// semicolon-separated `"name=rps:burst"` pairs; whitespace around names and
+    /// numbers is trimmed.
+    pub fn parse_stream_rate_overrides(&self) -> std::collections::HashMap<String, (u64, u64)> {
+        if self.stream_rate_overrides.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        self.stream_rate_overrides
+            .split(';')
+            .filter_map(|entry| {
+                let (name, rest) = entry.split_once('=')?;
+                let (rps_str, burst_str) = rest.split_once(':')?;
+                let rps: u64 = rps_str.trim().parse().ok()?;
+                let burst: u64 = burst_str.trim().parse().ok()?;
+                Some((name.trim().to_owned(), (rps, burst)))
+            })
+            .collect()
+    }
 }
 
 /// Generates a random node ID prefixed with `node_`.

@@ -10,6 +10,7 @@ pub(crate) mod auth;
 pub mod config;
 pub mod connection;
 pub(crate) mod errors;
+pub(crate) mod fanout;
 pub(crate) mod metrics;
 pub(crate) mod presence;
 pub(crate) mod protocol;

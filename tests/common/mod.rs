@@ -154,6 +154,10 @@ pub fn test_config(nats_url: &str) -> turbocable_server::config::Config {
         nats_stream_replicas: 1,
         replay_enforcement: turbocable_server::config::ReplayEnforcement::Compat,
         max_replay_concurrency: 10,
+        // Rate limiting disabled by default in tests.
+        stream_rate_limit_rps: 0,
+        stream_rate_limit_burst: 0,
+        stream_rate_overrides: String::new(),
     }
 }
 

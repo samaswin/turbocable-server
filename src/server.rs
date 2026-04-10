@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::connection::handler::{ws_upgrade, AppState};
 use crate::connection::limiter::ConnectionLimiter;
 use crate::connection::registry::Registry;
+use crate::fanout::StreamRateLimiter;
 use crate::metrics::Metrics;
 use crate::presence::PresenceManager;
 use crate::pubsub::nats::NatsConsumer;
@@ -66,7 +67,9 @@ pub async fn start(cfg: Config) -> ServerHandle {
         None
     };
 
-    let nats_consumer = init_nats_consumer(&cfg, &registry, Arc::clone(&metrics)).await;
+    let rate_limiter = build_rate_limiter(&cfg);
+    let nats_consumer =
+        init_nats_consumer(&cfg, &registry, Arc::clone(&metrics), rate_limiter).await;
     let presence = init_presence(&cfg).await;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -125,7 +128,9 @@ pub async fn run(cfg: Config) {
     let limiter = Arc::new(ConnectionLimiter::new(cfg.max_connections_per_ip));
 
     let jwt_verifier = init_jwt_verifier(&cfg).await;
-    let nats_consumer = init_nats_consumer(&cfg, &registry, Arc::clone(&metrics)).await;
+    let rate_limiter = build_rate_limiter(&cfg);
+    let nats_consumer =
+        init_nats_consumer(&cfg, &registry, Arc::clone(&metrics), rate_limiter).await;
     let presence = init_presence(&cfg).await;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -309,6 +314,7 @@ async fn init_nats_consumer(
     cfg: &Config,
     registry: &Arc<Registry>,
     metrics: Arc<Metrics>,
+    rate_limiter: Option<Arc<StreamRateLimiter>>,
 ) -> Option<Arc<NatsConsumer>> {
     match NatsConsumer::connect(&cfg.nats_url, cfg.nats_stream_replicas).await {
         Ok(consumer) => {
@@ -318,6 +324,7 @@ async fn init_nats_consumer(
                 Arc::clone(registry),
                 cfg.max_ack_pending,
                 metrics,
+                rate_limiter,
             );
             tracing::info!(
                 nats_url = %cfg.nats_url,
@@ -335,6 +342,27 @@ async fn init_nats_consumer(
             );
             None
         }
+    }
+}
+
+/// Builds a [`StreamRateLimiter`] from the config, or returns `None` if
+/// rate limiting is disabled (`stream_rate_limit_rps == 0` and no overrides).
+fn build_rate_limiter(cfg: &Config) -> Option<Arc<StreamRateLimiter>> {
+    let overrides = cfg.parse_stream_rate_overrides();
+    let rl = StreamRateLimiter::new(
+        cfg.stream_rate_limit_rps,
+        cfg.stream_rate_limit_burst,
+        overrides,
+    );
+    if rl.is_disabled() {
+        None
+    } else {
+        tracing::info!(
+            rps = cfg.stream_rate_limit_rps,
+            burst = cfg.stream_rate_limit_burst,
+            "per-stream rate limiting enabled"
+        );
+        Some(Arc::new(rl))
     }
 }
 

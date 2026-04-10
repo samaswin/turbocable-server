@@ -36,6 +36,7 @@ use tokio::sync::mpsc;
 
 use crate::connection::registry::Registry;
 use crate::errors::{GatewayError, ReplayDelivery, ReplayError};
+use crate::fanout::StreamRateLimiter;
 use crate::metrics::Metrics;
 use crate::protocol::types::ServerMessage;
 use crate::protocol::Codec;
@@ -113,17 +114,28 @@ impl NatsConsumer {
     ///
     /// The loop auto-reconnects on any error with a 2-second backoff.
     /// This method returns immediately; the loop runs until the process exits.
+    ///
+    /// `rate_limiter` — when `Some`, each NATS message is checked against the
+    /// per-stream token bucket before fan-out.  Pass `None` to disable rate
+    /// limiting entirely (equivalent to `rps = 0` in config).
     pub fn start_fanout_loop(
         self: &Arc<Self>,
         node_id: String,
         registry: Arc<Registry>,
         max_ack_pending: i64,
         metrics: Arc<Metrics>,
+        rate_limiter: Option<Arc<StreamRateLimiter>>,
     ) {
         let consumer = Arc::clone(self);
         tokio::spawn(async move {
             consumer
-                .fanout_loop(&node_id, &registry, max_ack_pending, &metrics)
+                .fanout_loop(
+                    &node_id,
+                    &registry,
+                    max_ack_pending,
+                    &metrics,
+                    rate_limiter.as_deref(),
+                )
                 .await;
         });
     }
@@ -365,10 +377,11 @@ impl NatsConsumer {
         registry: &Registry,
         max_ack_pending: i64,
         metrics: &Metrics,
+        rate_limiter: Option<&StreamRateLimiter>,
     ) {
         loop {
             match self
-                .run_consumer(node_id, registry, max_ack_pending, metrics)
+                .run_consumer(node_id, registry, max_ack_pending, metrics, rate_limiter)
                 .await
             {
                 Ok(()) => {
@@ -394,6 +407,7 @@ impl NatsConsumer {
         registry: &Registry,
         max_ack_pending: i64,
         metrics: &Metrics,
+        rate_limiter: Option<&StreamRateLimiter>,
     ) -> Result<(), GatewayError> {
         let stream = self
             .jetstream
@@ -447,7 +461,7 @@ impl NatsConsumer {
                         None => break,
                     };
 
-                    process_nats_message(&msg, registry, metrics);
+                    process_nats_message(&msg, registry, metrics, rate_limiter);
 
                     // Fire the ack in a background task so the fanout loop is never
                     // stalled by the NATS round-trip (publish + flush per message).
@@ -493,14 +507,45 @@ fn extract_stream_sequence(msg: &async_nats::jetstream::Message) -> Option<u64> 
 
 /// Decodes a NATS message, pre-encodes it for both wire formats, fans out
 /// to all WebSocket subscribers, and records fan-out metrics.
+///
+/// If `rate_limiter` is `Some` and the stream's token bucket is exhausted, the
+/// message is dropped before fan-out and counted in
+/// `turbocable_stream_rate_limited_total{stream}`.  The NATS message is still
+/// acknowledged regardless — we never want NATS to re-deliver a rate-limited
+/// message.
 fn process_nats_message(
     msg: &async_nats::jetstream::Message,
     registry: &Registry,
     metrics: &Metrics,
+    rate_limiter: Option<&StreamRateLimiter>,
 ) {
     let subject = msg.subject.as_str();
     let stream_name = extract_stream_name(subject);
     let sequence = extract_stream_sequence(msg);
+
+    // Rate-limit check: drop the message if the per-stream bucket is empty.
+    if let Some(rl) = rate_limiter {
+        let (allow, tokens) = rl.check(stream_name);
+        // Always sample the token gauge so operators can see bucket levels.
+        if tokens != i64::MAX {
+            metrics
+                .stream_tokens_available
+                .with_label_values(&[stream_name])
+                .set(tokens);
+        }
+        if !allow {
+            metrics
+                .stream_rate_limited_total
+                .with_label_values(&[stream_name])
+                .inc();
+            tracing::debug!(
+                stream = stream_name,
+                seq = sequence,
+                "message dropped: per-stream rate limit exceeded"
+            );
+            return;
+        }
+    }
 
     // Parse the payload as JSON first, falling back to MessagePack, then null.
     // Rails may publish either format depending on configuration.

@@ -176,6 +176,49 @@ groups:
             Clients are experiencing significant message delay.
             Consider scaling gateway instances or reducing publish rate.
 
+  - name: turbocable.rate_limiting
+    rules:
+
+      # ── Per-stream rate limiter triggered ────────────────────────────────────
+      #
+      # Fires when any stream is being rate-limited at a sustained rate.
+      # A non-zero drop rate means a publisher is consistently exceeding its
+      # configured limit.  Use the `stream` label to identify the offender.
+      #
+      # Tune the threshold based on acceptable burst traffic; 10/s is a
+      # reasonable starting point for most streams.
+
+      - alert: StreamRateLimiterTriggered
+        expr: >
+          rate(turbocable_stream_rate_limited_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream {{ $labels.stream }} is being rate-limited (> 10 drops/s sustained 5 m)"
+          description: >
+            Gateway {{ $labels.instance }} is dropping messages on stream
+            "{{ $labels.stream }}" at {{ $value | humanize }} drops/s.
+            The publisher is consistently exceeding the configured per-stream
+            rate limit.  Consider raising TURBOCABLE_STREAM_RATE_LIMIT_RPS /
+            TURBOCABLE_STREAM_RATE_OVERRIDES for this stream, or throttle the
+            publisher at the source.
+
+      - alert: StreamRateLimiterTriggeredCritical
+        expr: >
+          rate(turbocable_stream_rate_limited_total[5m]) > 1000
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Stream {{ $labels.stream }} drop rate > 1 000/s — publisher runaway"
+          description: >
+            Gateway {{ $labels.instance }} is dropping messages on stream
+            "{{ $labels.stream }}" at {{ $value | humanize }} drops/s.
+            This indicates a runaway publisher or misconfigured stream limit.
+            Investigate immediately: check TURBOCABLE_STREAM_RATE_LIMIT_RPS and
+            the publisher's send rate.
+
   - name: turbocable.auth
     rules:
 

@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use prometheus::{
     core::{AtomicI64, AtomicU64, GenericCounter, GenericGauge},
-    Histogram, HistogramOpts, TextEncoder,
+    Histogram, HistogramOpts, IntCounterVec, IntGaugeVec, TextEncoder,
 };
 
 /// Process-wide singleton so integration tests (multiple `start()` calls in one
@@ -73,6 +73,18 @@ pub struct Metrics {
     /// Wall-clock time from replay task start to the first message successfully enqueued.
     /// Serves as the server-side proxy for post-reconnect first-delivery latency.
     pub replay_first_delivery_secs: Histogram,
+
+    // --- Rate limiting metrics (Phase 4) ---
+    /// Messages dropped due to per-stream rate limiting, labeled by `stream`.
+    ///
+    /// Use `rate(turbocable_stream_rate_limited_total[5m])` to see the per-stream
+    /// drop rate and identify noisy publishers.
+    pub stream_rate_limited_total: IntCounterVec,
+    /// Current token count per stream (gauge sample), labeled by `stream`.
+    ///
+    /// Sampled on every NATS message that triggers a rate-limit check.  A value
+    /// near 0 means the stream is consistently near its configured limit.
+    pub stream_tokens_available: IntGaugeVec,
 }
 
 impl Metrics {
@@ -235,6 +247,20 @@ impl Metrics {
         ]))
         .expect("metric registration failed");
 
+        let stream_rate_limited_total = prometheus::register_int_counter_vec!(
+            "turbocable_stream_rate_limited_total",
+            "Messages dropped due to per-stream rate limiting",
+            &["stream"]
+        )
+        .expect("metric registration failed");
+
+        let stream_tokens_available = prometheus::register_int_gauge_vec!(
+            "turbocable_stream_tokens_available",
+            "Current token count for the per-stream rate limiter (gauge sample)",
+            &["stream"]
+        )
+        .expect("metric registration failed");
+
         Arc::new(Self {
             connections_active,
             connections_total,
@@ -259,6 +285,8 @@ impl Metrics {
             replay_in_flight,
             replay_catch_up_duration_secs,
             replay_first_delivery_secs,
+            stream_rate_limited_total,
+            stream_tokens_available,
         })
     }
 

@@ -92,6 +92,41 @@ curl http://localhost:9292/health
 | [docs/graceful-shutdown.md](docs/graceful-shutdown.md) | SIGTERM drain and Kubernetes notes |
 | [docs/binary-distribution.md](docs/binary-distribution.md) | Docker image, GitHub Releases binaries, cross-compilation |
 
+## Observability
+
+Start the full monitoring stack alongside the gateway cluster:
+
+```bash
+docker compose \
+  -f infra/docker-compose.nats.yml \
+  -f infra/docker-compose.cluster.yml \
+  -f infra/docker-compose.monitoring.yml \
+  up -d
+```
+
+| UI | URL | Credentials |
+|----|-----|-------------|
+| Grafana | http://localhost:3000 | admin / admin (change on first login) |
+| Prometheus | http://localhost:9090 | — |
+| Alertmanager | http://localhost:9093 | — |
+
+**Dashboard** — `infra/grafana/dashboards/turbocable.json` auto-provisioned by Grafana. Panels cover active connections, connect/disconnect rate, fan-out latency heatmap (p50/p95/p99), NATS consumer lag, backpressure evictions, per-IP rejections, JWT failures, and replay outcomes.
+
+**Alert rules** — `infra/prometheus/alerts.yml` contains five production-ready rule groups:
+- `ConnectionDropSpike` — active connections drop > 5% in 1 min, sustained 5 min
+- `FanoutLatencyP99High` — p99 fan-out > 50 ms, sustained 10 min
+- `NatsConsumerLag` — consumer pending > 10 k messages, sustained 5 min
+- `BackpressureEvictions` — any evictions sustained > 5 min
+- `PerIpLimiterSaturation` — rejection rate > 5%, sustained 5 min
+
+Validate rules locally (requires `promtool` from the [Prometheus release](https://github.com/prometheus/prometheus/releases)):
+
+```bash
+promtool check rules infra/prometheus/alerts.yml
+```
+
+**Structured logs** — every connection emits a `connection` tracing span carrying `connection_id` (UUID v4) and `conn_id` (sequential registry ID). All log events within the connection lifecycle — accept, auth, subscribe, close — are tagged with these fields for correlation across distributed traces.
+
 ## Docker and binaries
 
 ```bash

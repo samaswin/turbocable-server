@@ -13,7 +13,7 @@ global:
     cluster: turbocable
 
 rule_files:
-  - /etc/prometheus/rules/turbocable.rules.yml
+  - /etc/prometheus/rules/alerts.yml
 
 alerting:
   alertmanagers:

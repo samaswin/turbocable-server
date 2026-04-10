@@ -13,6 +13,9 @@ use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
 
+use tracing::Instrument;
+use uuid::Uuid;
+
 use crate::auth::jwt::{self, JwtVerifier};
 use crate::config::ReplayEnforcement;
 use crate::connection::limiter::ConnectionLimiter;
@@ -124,7 +127,16 @@ pub async fn ws_upgrade(
         None => (SUB_PROTOCOL_JSON, ws),
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, protocol, params.token, addr, state))
+    let connection_id = Uuid::new_v4();
+    ws.on_upgrade(move |socket| {
+        let span = tracing::info_span!(
+            "connection",
+            %connection_id,
+            conn_id = tracing::field::Empty,
+            %addr,
+        );
+        handle_socket(socket, protocol, params.token, addr, state, connection_id).instrument(span)
+    })
 }
 
 fn negotiate_protocol(header: &str) -> &'static str {
@@ -145,6 +157,7 @@ async fn handle_socket(
     token: Option<String>,
     addr: SocketAddr,
     state: AppState,
+    _connection_id: Uuid,
 ) {
     let ip = addr.ip();
 
@@ -214,6 +227,7 @@ async fn handle_socket(
 
     let is_binary = protocol == SUB_PROTOCOL_MSGPACK;
     let conn_id = state.registry.allocate_id();
+    tracing::Span::current().record("conn_id", conn_id);
     let (live_tx, live_rx) = mpsc::channel::<Bytes>(state.ws_channel_capacity);
     let (replay_tx, replay_rx) = mpsc::channel::<Bytes>(state.ws_replay_channel_capacity);
     let (urgent_close_tx, urgent_close_rx) = mpsc::channel::<Bytes>(1);
@@ -245,16 +259,19 @@ async fn handle_socket(
 
     let (ws_sender, ws_receiver) = socket.split();
 
-    let outbound_handle = tokio::spawn(outbound_loop(
-        live_rx,
-        replay_rx,
-        urgent_close_rx,
-        ws_sender,
-        is_binary,
-        state.shutdown_rx.clone(),
-        evict_rx,
-        disconnect_frame,
-    ));
+    let outbound_handle = tokio::spawn(
+        outbound_loop(
+            live_rx,
+            replay_rx,
+            urgent_close_rx,
+            ws_sender,
+            is_binary,
+            state.shutdown_rx.clone(),
+            evict_rx,
+            disconnect_frame,
+        )
+        .instrument(tracing::Span::current()),
+    );
 
     let ctx = ConnContext {
         conn_id,

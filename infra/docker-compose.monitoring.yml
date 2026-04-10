@@ -22,7 +22,7 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./alertmanager/turbocable.rules.yml:/etc/prometheus/rules/turbocable.rules.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/rules/alerts.yml:ro
       - prometheus-data:/prometheus
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
@@ -57,7 +57,7 @@ services:
       GF_USERS_ALLOW_SIGN_UP:     "false"
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./grafana/turbocable_dashboard.json:/var/lib/grafana/dashboards/turbocable.json:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     networks:
       - monitoring

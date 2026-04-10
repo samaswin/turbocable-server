@@ -1,0 +1,200 @@
+## TurboCable — Prometheus Alerting Rules
+##
+## Load this file into Prometheus by referencing it in prometheus.yml:
+##
+##   rule_files:
+##     - /etc/prometheus/rules/alerts.yml
+##
+## Or mount it via infra/docker-compose.monitoring.yml (see volume section).
+##
+## Validate before deploying:
+##   promtool check rules infra/prometheus/alerts.yml
+##
+## Severity levels:
+##   warning  — investigate soon; not yet user-visible
+##   critical — user-visible degradation; page on-call immediately
+
+groups:
+  - name: turbocable.connections
+    rules:
+
+      # ── Connection drop spike ────────────────────────────────────────────────
+      #
+      # Fires when the rate of connection closures (inferred from the drop in
+      # active connections relative to the previous minute) spikes above a safe
+      # threshold.  Guard clause (> 1 000) suppresses false positives during
+      # low-traffic windows.
+
+      - alert: ConnectionDropSpike
+        expr: >
+          (turbocable_connections_active offset 1m - turbocable_connections_active)
+          / turbocable_connections_active offset 1m > 0.05
+          and turbocable_connections_active offset 1m > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Active connections dropped > 5% in the last minute (sustained 5 m)"
+          description: >
+            Gateway {{ $labels.instance }} has been shedding connections for
+            more than 5 minutes.  Current active: {{ $value | humanize }}.
+            Check for gateway restarts, LB health-check failures, or network
+            partitions.
+
+      - alert: ConnectionDropSpikeCritical
+        expr: >
+          (turbocable_connections_active offset 1m - turbocable_connections_active)
+          / turbocable_connections_active offset 1m > 0.20
+          and turbocable_connections_active offset 1m > 1000
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Active connections dropped > 20% — likely gateway crash"
+          description: >
+            Gateway {{ $labels.instance }} lost more than 20% of its connections
+            in the last minute and has sustained this for 2 minutes.
+            Investigate immediately: gateway crash, total network failure, or LB
+            misconfiguration.
+
+      # ── Per-IP limiter saturation ────────────────────────────────────────────
+      #
+      # Fires when more than 5% of inbound connection attempts are being rejected.
+      # Rejections cover both JWT auth failure and per-IP limit hits; use the
+      # annotation to distinguish with a subsequent PromQL query.
+
+      - alert: PerIpLimiterSaturation
+        expr: >
+          rate(turbocable_connections_rejected_total[5m])
+          / (
+              rate(turbocable_connections_total[5m])
+            + rate(turbocable_connections_rejected_total[5m])
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of connections rejected (sustained 5 m)"
+          description: >
+            Gateway {{ $labels.instance }} is rejecting
+            {{ $value | humanizePercentage }} of connection attempts.
+            Check for JWT key rotation issues, per-IP abusers, or client
+            misconfiguration.  Run:
+            rate(turbocable_connections_rejected_total[5m]) to see raw rate.
+
+  - name: turbocable.fanout
+    rules:
+
+      # ── Fan-out latency p99 ──────────────────────────────────────────────────
+      #
+      # SLO: p99 < 50 ms on a 3-node cluster, < 30 ms on a single node.
+      # This alert fires at the cluster threshold.
+
+      - alert: FanoutLatencyP99High
+        expr: >
+          histogram_quantile(0.99,
+            rate(turbocable_fanout_duration_seconds_bucket[5m])
+          ) > 0.050
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fan-out p99 latency > 50 ms (sustained 10 m)"
+          description: >
+            Gateway {{ $labels.instance }} p99 fan-out latency is
+            {{ $value | humanizeDuration }}.
+            Check NATS consumer lag, CPU saturation, or outbound channel
+            back-pressure.
+
+      - alert: FanoutLatencyP99Critical
+        expr: >
+          histogram_quantile(0.99,
+            rate(turbocable_fanout_duration_seconds_bucket[5m])
+          ) > 0.200
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fan-out p99 latency > 200 ms — SLO breach"
+          description: >
+            Gateway {{ $labels.instance }} p99 fan-out latency is
+            {{ $value | humanizeDuration }}, which exceeds the 1M-connection
+            SLO target.  Consider scaling, reducing backlog, or shedding load.
+
+      # ── Backpressure evictions ───────────────────────────────────────────────
+      #
+      # When a client's outbound channel is full the gateway evicts it with a
+      # disconnect frame (reconnect=true).  Any evictions at all are a warning;
+      # sustained evictions indicate slow consumers or undersized outbound buffers.
+
+      - alert: BackpressureEvictions
+        expr: rate(turbocable_forced_reconnect_backpressure_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backpressure-driven reconnects sustained for 5 m"
+          description: >
+            Gateway {{ $labels.instance }} is forcing reconnects at
+            {{ $value | humanize }}/s due to full outbound channels.
+            Clients should reconnect and replay from last_seq.
+            Consider reducing publish rate, increasing ws_channel_capacity,
+            or scaling consumer count.
+
+  - name: turbocable.nats
+    rules:
+
+      # ── NATS consumer lag ────────────────────────────────────────────────────
+      #
+      # The durable consumer accumulates pending messages when the gateway falls
+      # behind the publish rate.  >10 k means fan-out latency will increase;
+      # >50 k is a critical SLO breach.
+
+      - alert: NatsConsumerLag
+        expr: turbocable_nats_consumer_lag > 10000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NATS consumer lag > 10 k messages (sustained 5 m)"
+          description: >
+            Gateway {{ $labels.instance }} has {{ $value | humanize }} unacknowledged
+            NATS messages.  Fan-out latency will increase.
+            Check publish rate vs. gateway throughput.
+            Run: nats consumer info TURBOCABLE gw_<node_id>
+
+      - alert: NatsConsumerLagCritical
+        expr: turbocable_nats_consumer_lag > 50000
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NATS consumer lag > 50 k messages — SLO breach"
+          description: >
+            Gateway {{ $labels.instance }} is severely behind with
+            {{ $value | humanize }} pending NATS messages.
+            Clients are experiencing significant message delay.
+            Consider scaling gateway instances or reducing publish rate.
+
+  - name: turbocable.auth
+    rules:
+
+      # ── JWT auth latency ─────────────────────────────────────────────────────
+      #
+      # JWT verification should be < 1 ms typical.  Spikes indicate key-reload
+      # contention or NATS KV latency issues.
+
+      - alert: AuthLatencyHigh
+        expr: >
+          histogram_quantile(0.99,
+            rate(turbocable_auth_duration_seconds_bucket[5m])
+          ) > 0.010
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "JWT auth p99 latency > 10 ms"
+          description: >
+            Gateway {{ $labels.instance }} p99 JWT verification latency is
+            {{ $value | humanizeDuration }}.
+            Check NATS KV latency or key-reload frequency.

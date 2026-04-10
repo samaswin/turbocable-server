@@ -289,18 +289,26 @@ async fn outbound_loop(
     disconnect_frame: Bytes,
 ) {
     let mut urgent_open = true;
+    let mut evict_open = true;
 
     'ws: loop {
         tokio::select! {
             biased;
 
             // Eviction takes highest priority: send the disconnect frame and close.
-            _ = evict_rx.recv() => {
-                if let Some(msg) = bytes_to_ws_msg(disconnect_frame.clone(), is_binary) {
-                    let _ = sender.send(msg).await;
+            // Guard with `evict_open` so a dropped evict_tx (deregister on shutdown)
+            // doesn't trigger a spurious eviction close before the shutdown branch fires.
+            evict = evict_rx.recv(), if evict_open => {
+                match evict {
+                    Some(()) => {
+                        if let Some(msg) = bytes_to_ws_msg(disconnect_frame.clone(), is_binary) {
+                            let _ = sender.send(msg).await;
+                        }
+                        let _ = sender.close().await;
+                        return;
+                    }
+                    None => evict_open = false,
                 }
-                let _ = sender.close().await;
-                return;
             }
 
             urgent = urgent_close_rx.recv(), if urgent_open => {

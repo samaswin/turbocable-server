@@ -122,6 +122,18 @@ Use [docs/load-testing-1m.md](docs/load-testing-1m.md) for the full guide (smoke
 | [turbocable-rails](https://github.com/samaswin/turbocable-rails) | DSL for TurboCable broadcasts |
 | [@turbocable/client](https://github.com/samaswin/turbocable-client) | JavaScript client for browser connections |
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build/test commands, the PR checklist, commit style, and how to run k6 load tests.
+
+## Security
+
+To report a vulnerability privately, use [GitHub Security Advisories](https://github.com/samaswin/turbocable-server/security/advisories/new). See [SECURITY.md](SECURITY.md) for the full disclosure policy and supported versions.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a full history of releases.
+
 ## License
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.

@@ -1,11 +1,15 @@
 //! Prometheus metrics for connection counts, fan-out latency, and NATS consumer lag.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use prometheus::{
     core::{AtomicI64, AtomicU64, GenericCounter, GenericGauge},
     Histogram, HistogramOpts, TextEncoder,
 };
+
+/// Process-wide singleton so integration tests (multiple `start()` calls in one
+/// process) don't collide on the global Prometheus registry.
+static METRICS_INSTANCE: OnceLock<Arc<Metrics>> = OnceLock::new();
 
 /// All Prometheus metrics exported by the gateway.
 pub struct Metrics {
@@ -72,10 +76,17 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// Registers all metrics with the default Prometheus registry and returns the handle.
+    /// Returns the process-wide metrics handle, registering with the default
+    /// Prometheus registry on the first call and returning the cached handle
+    /// on subsequent calls.
     ///
-    /// Panics if any metric name is already registered (should only be called once).
+    /// Using a singleton avoids double-registration panics when the gateway is
+    /// started more than once in the same process (e.g. integration tests).
     pub fn new() -> Arc<Self> {
+        METRICS_INSTANCE.get_or_init(Self::create).clone()
+    }
+
+    fn create() -> Arc<Self> {
         let connections_active = prometheus::register_int_gauge!(
             "turbocable_connections_active",
             "Current number of open WebSocket connections"

@@ -26,6 +26,92 @@ const DRAIN_TIMEOUT_SECS: u64 = 30;
 /// How often to poll the connection count while draining.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Handle to a server instance started with [`start`].
+///
+/// When dropped, sends the graceful-shutdown signal to all active WebSocket
+/// connections (close code 1001). Used by integration tests to control server
+/// lifetime without involving OS signals.
+pub struct ServerHandle {
+    /// The local address the server is listening on.
+    pub addr: std::net::SocketAddr,
+    /// Sending `true` signals all active WebSocket connections to close (code 1001).
+    pub shutdown_tx: watch::Sender<bool>,
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+}
+
+/// Starts the server in a background task and returns as soon as the listener
+/// is bound.
+///
+/// Intended for integration tests. Production code should call [`run`] instead,
+/// which blocks until SIGTERM / Ctrl-C and handles NATS flush and drain.
+pub async fn start(cfg: Config) -> ServerHandle {
+    let metrics = Metrics::new();
+    let registry = Arc::new(Registry::new());
+    let limiter = Arc::new(ConnectionLimiter::new(cfg.max_connections_per_ip));
+
+    // JWT verifier: load from file if path is set, otherwise skip (no NATS KV in tests).
+    let jwt_verifier: Option<Arc<JwtVerifier>> = if let Some(ref path) = cfg.jwt_public_key_path {
+        let pem = tokio::fs::read(path)
+            .await
+            .unwrap_or_else(|e| panic!("start(): failed to read JWT public key '{path}': {e}"));
+        let verifier = JwtVerifier::from_rsa_pem(&pem)
+            .unwrap_or_else(|e| panic!("start(): invalid JWT public key '{path}': {e}"));
+        Some(Arc::new(verifier))
+    } else {
+        None
+    };
+
+    let nats_consumer = init_nats_consumer(&cfg, &registry, Arc::clone(&metrics)).await;
+    let presence = init_presence(&cfg).await;
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let replay_semaphore = Arc::new(tokio::sync::Semaphore::new(cfg.max_replay_concurrency));
+
+    let state = AppState {
+        registry,
+        limiter,
+        ping_interval_secs: cfg.ping_interval_secs,
+        jwt_verifier,
+        nats_consumer,
+        presence,
+        metrics,
+        shutdown_rx,
+        ws_channel_capacity: cfg.ws_channel_capacity,
+        ws_replay_channel_capacity: cfg.ws_replay_channel_capacity,
+        replay_enforcement: cfg.replay_enforcement,
+        replay_semaphore,
+    };
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/metrics", get(metrics_handler))
+        .route("/pubkey", get(pubkey_handler))
+        .route("/cable", get(ws_upgrade))
+        .with_state(state);
+
+    let listener = create_listener(cfg.port)
+        .unwrap_or_else(|e| panic!("start(): failed to bind listener: {e}"));
+    let addr = listener
+        .local_addr()
+        .expect("start(): listener must have a local address");
+
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
+    });
+
+    ServerHandle { addr, shutdown_tx }
+}
+
 /// Starts the gateway: builds shared state, binds the listener, and serves requests.
 ///
 /// On SIGTERM (or Ctrl-C in dev), the server:

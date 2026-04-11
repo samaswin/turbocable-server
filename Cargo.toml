@@ -1,3 +1,8 @@
+[features]
+# Exposes internal protocol and auth modules for the fuzz sub-crate.
+# Not intended for normal builds or tests.
+fuzz = []
+
 [package]
 name        = "turbocable-server"
 version     = "0.5.0"

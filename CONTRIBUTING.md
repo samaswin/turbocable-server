@@ -135,6 +135,74 @@ Full guide including three-node cluster setup and Prometheus validation:
 
 ---
 
+## Fuzz testing
+
+Fuzz targets live in `fuzz/` and cover the three untrusted parsers:
+
+| Target | What it tests |
+|--------|---------------|
+| `json_decode` | JSON → `ClientFrame` parser |
+| `msgpack_decode` | MessagePack → `ClientFrame` parser |
+| `jwt_decode` | `JwtVerifier::verify` on arbitrary token strings |
+
+### One-time setup
+
+`cargo-fuzz` requires a nightly Rust toolchain and is **not** installed by default.
+Run the following **once** inside WSL:
+
+```bash
+# Install the nightly toolchain
+rustup toolchain install nightly
+
+# Install cargo-fuzz (uses stable cargo to install, but runs under nightly)
+cargo install cargo-fuzz
+```
+
+`fuzz/rust-toolchain.toml` pins the fuzz sub-crate to nightly, so `cargo fuzz`
+picks up the right compiler automatically.
+
+### Smoke run (60 s per target)
+
+Run from the **repo root** inside WSL:
+
+```bash
+# JSON codec
+cargo +nightly fuzz run json_decode -- -max_total_time=60
+
+# MessagePack codec (uses a learned dictionary for better coverage)
+cargo +nightly fuzz run msgpack_decode -- -dict=fuzz/dict/msgpack_decode.dict -max_total_time=60
+
+# JWT parser (uses a learned dictionary for better coverage)
+cargo +nightly fuzz run jwt_decode -- -dict=fuzz/dict/jwt_decode.dict -max_total_time=60
+```
+
+Seed corpora in `fuzz/corpus/<target>/` are passed automatically.
+Dictionaries in `fuzz/dict/` contain tokens libFuzzer learned from the protocol
+and JWT structures; passing them speeds up coverage on long runs.
+
+### Longer / nightly runs
+
+Omit `-max_total_time` to run indefinitely (stop with Ctrl-C):
+
+```bash
+cargo +nightly fuzz run json_decode
+```
+
+Crashes are saved to `fuzz/artifacts/<target>/` and can be reproduced with:
+
+```bash
+cargo +nightly fuzz run json_decode fuzz/artifacts/json_decode/<crash-file>
+```
+
+### Note on CI
+
+`cargo fuzz` is nightly-only and CPU-intensive; it is **not** part of the
+standard CI pipeline.  Short smoke runs (60 s) are expected to be run manually
+by the committer before opening a PR that touches the protocol codecs or JWT
+verifier.
+
+---
+
 ## Prometheus alert validation
 
 When modifying `infra/prometheus/alerts.yml`:

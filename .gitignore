@@ -32,3 +32,6 @@ bench/results/
 /Purging
 /Running
 /Starting
+fuzz/corpus/
+fuzz/target/
+fuzz/dict/

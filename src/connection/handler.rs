@@ -923,7 +923,7 @@ mod tests {
             user_id: None,
         };
 
-        let before = state.metrics.handshake_legacy_warn_total.get() as u64;
+        let before = state.metrics.handshake_legacy_warn_total.get();
         let mut conn_state = ConnectionState::AwaitingHello;
         let mut replay_capable = false;
         let mut last_seq = None;
@@ -946,7 +946,7 @@ mod tests {
             "should transition to Active"
         );
         assert_eq!(
-            state.metrics.handshake_legacy_warn_total.get() as u64,
+            state.metrics.handshake_legacy_warn_total.get(),
             before + 1,
             "legacy warn counter should increment"
         );
@@ -975,7 +975,7 @@ mod tests {
             user_id: None,
         };
 
-        let before_rejected = state.metrics.handshake_rejected_total.get() as u64;
+        let before_rejected = state.metrics.handshake_rejected_total.get();
         let mut conn_state = ConnectionState::AwaitingHello;
         let mut replay_capable = false;
         let mut last_seq = None;
@@ -998,7 +998,7 @@ mod tests {
             "should stay AwaitingHello"
         );
         assert!(
-            state.metrics.handshake_rejected_total.get() as u64 > before_rejected,
+            state.metrics.handshake_rejected_total.get() > before_rejected,
             "rejected counter should increment"
         );
         let msg = live_rx.try_recv().expect("reject_subscription expected");
@@ -1026,7 +1026,7 @@ mod tests {
         let before_soft = state
             .metrics
             .handshake_soft_non_replay_subscribe_allowed_total
-            .get() as u64;
+            .get();
         let mut conn_state = ConnectionState::AwaitingHello;
         let mut replay_capable = false;
         let mut last_seq = None;
@@ -1062,7 +1062,7 @@ mod tests {
             state
                 .metrics
                 .handshake_soft_non_replay_subscribe_allowed_total
-                .get() as u64,
+                .get(),
             before_soft + 1,
             "soft non-replay-subscribe counter should increment"
         );
@@ -1096,7 +1096,7 @@ mod tests {
             user_id: None,
         };
 
-        let before_rejected = state.metrics.handshake_rejected_total.get() as u64;
+        let before_rejected = state.metrics.handshake_rejected_total.get();
         let mut conn_state = ConnectionState::AwaitingHello;
         let mut replay_capable = false;
         let mut last_seq = None;
@@ -1118,7 +1118,7 @@ mod tests {
             ConnectionState::AwaitingHello,
             "should stay AwaitingHello"
         );
-        assert!(state.metrics.handshake_rejected_total.get() as u64 > before_rejected);
+        assert!(state.metrics.handshake_rejected_total.get() > before_rejected);
         let msg = live_rx.try_recv().expect("reject_subscription expected");
         let val: serde_json::Value = serde_json::from_slice(&msg).unwrap();
         assert_eq!(val["type"], "reject_subscription");
@@ -1144,7 +1144,7 @@ mod tests {
         let before_non_replay = state
             .metrics
             .handshake_rejected_non_replay_capable_total
-            .get() as u64;
+            .get();
         let mut conn_state = ConnectionState::AwaitingHello;
         let mut replay_capable = false;
         let mut last_seq = None;
@@ -1180,7 +1180,7 @@ mod tests {
             state
                 .metrics
                 .handshake_rejected_non_replay_capable_total
-                .get() as u64,
+                .get(),
             before_non_replay + 1,
             "non-replay-capable reject counter should increment"
         );
@@ -1271,7 +1271,7 @@ mod tests {
             user_id: None,
         };
 
-        let before = state.metrics.handshake_ok_replay_capable_total.get() as u64;
+        let before = state.metrics.handshake_ok_replay_capable_total.get();
         let mut conn_state = ConnectionState::AwaitingHello;
         let mut replay_capable = false;
         let mut last_seq = None;
@@ -1290,7 +1290,7 @@ mod tests {
 
         assert_eq!(conn_state, ConnectionState::Active);
         assert!(replay_capable);
-        assert!(state.metrics.handshake_ok_replay_capable_total.get() as u64 > before);
+        assert!(state.metrics.handshake_ok_replay_capable_total.get() > before);
     }
 
     #[tokio::test]
@@ -1310,7 +1310,7 @@ mod tests {
             user_id: None,
         };
 
-        let before = state.metrics.handshake_ok_legacy_total.get() as u64;
+        let before = state.metrics.handshake_ok_legacy_total.get();
         let mut conn_state = ConnectionState::AwaitingHello;
         let mut replay_capable = false;
         let mut last_seq = None;
@@ -1329,6 +1329,6 @@ mod tests {
 
         assert_eq!(conn_state, ConnectionState::Active);
         assert!(!replay_capable);
-        assert!(state.metrics.handshake_ok_legacy_total.get() as u64 > before);
+        assert!(state.metrics.handshake_ok_legacy_total.get() > before);
     }
 }

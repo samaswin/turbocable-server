@@ -227,7 +227,7 @@ Every push and pull request to `main` runs:
 | Documentation | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` |
 | Security audit | `cargo audit` |
 | MSRV check | `cargo check` at `rust-version` in `Cargo.toml` |
-| Release | Cross-compile + Docker multi-platform push to `ghcr.io/turbocable/server` |
+| Release | Cross-compile + Docker multi-platform push to `ghcr.io/<repository-owner>/turbocable-server` |
 
 ---
 

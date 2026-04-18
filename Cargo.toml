@@ -5,7 +5,7 @@ fuzz = []
 
 [package]
 name        = "turbocable-server"
-version     = "0.5.0"
+version     = "0.5.1"
 edition     = "2021"
 description = "High-performance WebSocket gateway for TurboCable (1M+ connections)"
 license     = "MIT"

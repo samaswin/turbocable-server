@@ -55,7 +55,7 @@ Every push and pull request to `main` runs these checks in GitHub Actions:
 | **Documentation** | `cargo doc --no-deps` with `-D warnings` |
 | **Security audit** | `cargo audit` |
 | **MSRV** | `cargo check` at the `rust-version` declared in `Cargo.toml` |
-| **Release** | Cross-compiles platform binaries, multi-platform Docker image, publish to `ghcr.io/turbocable/server` |
+| **Release** | Cross-compiles platform binaries, multi-platform Docker image, publish to `ghcr.io/<repository-owner>/turbocable-server` |
 
 ---
 

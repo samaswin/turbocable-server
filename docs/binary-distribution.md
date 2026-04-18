@@ -50,22 +50,24 @@ Multi-platform images (linux/amd64 and linux/arm64) are published to the
 GitHub Container Registry on every release:
 
 ```bash
-# Pull for the current host platform
-docker pull ghcr.io/turbocable/server:latest
+# Pull for the current host platform (this repo → ghcr.io/samaswin/turbocable-server)
+docker pull ghcr.io/samaswin/turbocable-server:latest
 
 # Pull a specific version
-docker pull ghcr.io/turbocable/server:0.4.0
+docker pull ghcr.io/samaswin/turbocable-server:0.5.1
 
 # Explicitly target ARM64 (e.g. from an x86_64 host)
-docker pull --platform linux/arm64 ghcr.io/turbocable/server:latest
+docker pull --platform linux/arm64 ghcr.io/samaswin/turbocable-server:latest
 ```
+
+Releases push to `ghcr.io/<repository-owner>/turbocable-server` (your GitHub user or org that owns the repository). Forks publish under the fork owner’s namespace.
 
 ### Run
 
 ```bash
 docker run -p 9292:9292 \
   -e TURBOCABLE_NATS_URL=nats://host.docker.internal:4222 \
-  ghcr.io/turbocable/server:latest
+  ghcr.io/samaswin/turbocable-server:latest
 ```
 
 Pass any configuration via environment variables — see the
@@ -132,7 +134,7 @@ build-linux          build-macos
 - Depends on `build-linux`
 - Downloads the pre-built amd64 and arm64 musl binaries
 - Builds a multi-platform Docker image using `docker buildx` + `Dockerfile.dist`
-- Pushes to `ghcr.io/turbocable/server` with `latest`, `MAJOR.MINOR`, and full
+- Pushes to `ghcr.io/<repository-owner>/turbocable-server` with `latest`, `MAJOR.MINOR`, and full
   version tags
 - Verifies the published image is under 20 MB
 

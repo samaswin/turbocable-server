@@ -227,7 +227,8 @@ spec:
 
       containers:
         - name: gateway
-          image: turbocable/server:latest
+          # Same image as releases: ghcr.io/<your-github-owner>/turbocable-server
+          image: ghcr.io/samaswin/turbocable-server:latest
           lifecycle:
             preStop:
               exec:

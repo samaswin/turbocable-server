@@ -11,7 +11,7 @@
 #   docker buildx build \
 #     --platform linux/amd64,linux/arm64 \
 #     -f Dockerfile.dist \
-#     -t ghcr.io/turbocable/server:latest \
+#     -t ghcr.io/<owner>/turbocable-server:latest \
 #     --push \
 #     dist/
 

@@ -130,11 +130,13 @@ promtool check rules infra/prometheus/alerts.yml
 ## Docker and binaries
 
 ```bash
-docker pull ghcr.io/turbocable/server:latest
+docker pull ghcr.io/samaswin/turbocable-server:latest
 docker run -p 9292:9292 \
   -e TURBOCABLE_NATS_URL=nats://host.docker.internal:4222 \
-  ghcr.io/turbocable/server:latest
+  ghcr.io/samaswin/turbocable-server:latest
 ```
+
+The image is published under the GitHub **repository owner** name. If you use a fork, substitute your username: `ghcr.io/<owner>/turbocable-server`.
 
 Full table of release artifacts and `docker build` instructions: [docs/binary-distribution.md](docs/binary-distribution.md).
 

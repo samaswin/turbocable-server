@@ -24,6 +24,13 @@ Work planned in Phases 2–7 of the v0.5.0 → v0.6.0 gap-fix plan:
 
 ---
 
+## [0.5.1] - 2026-04-18
+
+### Changed
+- **Docker / GHCR:** Release workflow publishes to `ghcr.io/<repository-owner>/turbocable-server` (e.g. `ghcr.io/samaswin/turbocable-server`) instead of `ghcr.io/turbocable/server`, so images appear under the GitHub account that owns the repository. Set the package to **Public** in GitHub Packages for unauthenticated `docker pull`. `workflow_dispatch` also tags `latest` so manual runs produce a pullable image.
+
+---
+
 ## [0.5.0] - 2026-03-28
 
 ### Added
@@ -102,7 +109,8 @@ Work planned in Phases 2–7 of the v0.5.0 → v0.6.0 gap-fix plan:
 - jemalloc allocator enabled on glibc Linux for reduced fragmentation under heavy load
 - `SO_REUSEPORT` + `TCP_NODELAY` socket options applied at bind time
 
-[Unreleased]: https://github.com/samaswin/turbocable-server/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/samaswin/turbocable-server/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/samaswin/turbocable-server/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/samaswin/turbocable-server/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/samaswin/turbocable-server/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/samaswin/turbocable-server/compare/v0.2.0...v0.3.0

@@ -1,9 +1,2 @@
 [advisories]
-ignore = [
-    # RUSTSEC-2026-0049: rustls-webpki 0.102.8 — CRL distribution point matching bug.
-    # The fix exists only in rustls-webpki >=0.103.10, which is a semver-incompatible
-    # API from the 0.102.x series. async-nats 0.46.0 depends on 0.102.x directly and
-    # cannot be updated without an upstream async-nats release. This advisory should be
-    # removed once async-nats ships a version that uses rustls-webpki 0.103.x.
-    "RUSTSEC-2026-0049",
-]
+ignore = []

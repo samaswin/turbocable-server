@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -360,14 +361,17 @@ pub fn make_expired_jwt(sub: &str) -> String {
 // Convenience: write the test public key PEM to a temp file.
 // ---------------------------------------------------------------------------
 
+static TEST_PUBKEY_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
 /// Writes the test RSA public key to a temp file and returns the path.
 ///
-/// The file is written to the system temp directory with a deterministic name
-/// (`turbocable_test_pubkey.pem`). Multiple concurrent calls writing the same
-/// content are safe on Linux.
+/// Uses a unique filename per call so parallel integration tests (default
+/// `cargo test` harness) never read a partially written or truncated PEM from
+/// a shared path.
 pub async fn write_test_pubkey() -> std::path::PathBuf {
-    let path = std::env::temp_dir().join("turbocable_test_pubkey.pem");
-    tokio::fs::write(&path, TEST_RSA_PUBLIC_KEY)
+    let id = TEST_PUBKEY_FILE_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("turbocable_test_pubkey_{id}.pem"));
+    tokio::fs::write(&path, TEST_RSA_PUBLIC_KEY.as_bytes())
         .await
         .expect("write test public key");
     path
